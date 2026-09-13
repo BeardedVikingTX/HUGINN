@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-#  HUGINN :: xss.py
-#  The Ultimate Cross-Site Scripting Scanner — 2026 Edition
+#  HUGINN :: xss.py — v3.0
+#  Cross-Site Scripting Scanner — baseline-compared, false-positive resistant
 # -----------------------------------------------------------------------------
-#  Detection pipeline:
-#    1. Send a marker into every injectable parameter
-#    2. Detect where it reflected (HTML body / attr / JS string / CSS / etc.)
-#    3. Dispatch only payloads whose context matches (plus polyglots)
-#    4. For each payload, verify via:
-#         · payload_survival   — payload survives unmodified in a live context
-#         · dangerous_markup   — <script>, onerror=, javascript:, etc. present
-#         · oob_callback       — token appears in oast.beardedviking.org check
-#         · browser_dialog     — Playwright observed alert/confirm/prompt
-#    5. Emit a fully self-contained finding with cURL for reproduction
+#  Core verification pipeline (in priority order):
 #
-#  Injection transports:
-#    · Query params · POST form bodies · JSON bodies · Cookies · Headers
-#    · Path segments · HTTP parameter pollution
+#    1. OOB_CONFIRMED  — token observed in oast.beardedviking.org log
+#                        (blind payloads: this is the ONLY valid signal)
+#    2. BROWSER_DIALOG — Playwright observed alert/confirm/prompt
+#    3. PAYLOAD_SURVIVAL — exact payload string in body, unencoded, in an
+#                          executable context (not HTML-escaped, not inside
+#                          a <title>/<textarea>/comment)
+#    4. MARKUP_DELTA   — dangerous markup patterns that appear MORE in the
+#                        current response than the baseline (delta >= 1)
+#    5. REFLECTION     — raw reflection in a dangerous context with no
+#                        execution proof (low severity, informational)
+#
+#  What changed in v3.0:
+#    · Blinded markup detection — no more firing on <meta> tags that were
+#      already in the page's own HTML
+#    · Baseline delta — compares current response against baseline for
+#      every dangerous pattern with occurrence counting
+#    · Payload survival — checks for exact payload AND URL-decoded variant
+#      AND HTML-decoded variant
+#    · Blind payloads skip markup detection entirely
+#    · Strict mode — only report findings with confirmed verification
 # =============================================================================
 
 import re
@@ -27,6 +35,7 @@ import uuid
 import shlex
 import hashlib
 import threading
+from collections import Counter
 from pathlib import Path
 from urllib.parse import (urlparse, parse_qs, urlencode, urlunparse,
                           urljoin, quote, unquote)
@@ -35,7 +44,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from huginn_utils import (
     log, section, load_json, save_json, load_payloads, send_request,
     safe_filename, C,
-    random_token, build_oob_url,        # per-payload OOB URL builder
+    random_token, build_oob_url,
 )
 
 try:
@@ -57,7 +66,9 @@ DEFAULT_ATTACKER = "beardedviking.org"
 DEFAULT_COLLAB   = "oast.beardedviking.org"
 DEFAULT_ALERT    = "alert(document.domain)"
 
-# Dangerous patterns — presence in body (unescaped) is a strong indicator
+# Dangerous markup patterns. We track COUNTS of each so we can measure a
+# delta against baseline. Counting matters — a page with 5 <script> tags
+# that gets a 6th from a payload is different from a page with 0.
 DANGEROUS_PATTERNS = [
     (re.compile(r"<script[\s>]", re.I), "script_tag"),
     (re.compile(r"</script\s*>", re.I), "script_close"),
@@ -66,45 +77,49 @@ DANGEROUS_PATTERNS = [
                 re.I), "javascript_uri"),
     (re.compile(r"[\"']\s*javascript\s*:", re.I), "javascript_uri_quoted"),
     (re.compile(r"<svg[^>]*onload\s*=", re.I), "svg_onload"),
-    (re.compile(r"<svg[^>]*>", re.I), "svg_tag"),
     (re.compile(r"<math[^>]*>", re.I), "mathml_tag"),
     (re.compile(r"(?:href|src|action)\s*=\s*[\"']?\s*data:text/html",
                 re.I), "data_html_uri"),
-    (re.compile(r"<(?:iframe|object|embed|meta)[\s>]", re.I), "dangerous_tag"),
+    (re.compile(r"<(?:iframe|object|embed)[\s>]", re.I), "dangerous_tag"),
+    (re.compile(r"<meta[^>]*http-equiv\s*=\s*[\"']?refresh", re.I), "meta_refresh"),
     (re.compile(r"\{\{[^}]*(?:constructor|eval|alert|onerror)[^}]*\}\}",
                 re.I), "template_injection"),
 ]
 
-# Event handler names commonly used in XSS
-EVENT_HANDLER_NAMES = {
-    "onerror", "onload", "onclick", "onmouseover", "onmouseenter",
-    "onfocus", "onblur", "onsubmit", "onchange", "oninput",
-    "onanimationstart", "onanimationend", "onbegin", "ontoggle",
-    "onpopstate", "onhashchange", "onpageshow", "onfocusin",
-    "onpointerover", "oncontentvisibilityautostatechange",
-    "onbeforetoggle", "onbeforematch", "onreadystatechange", "onscroll",
+# Contexts where a surviving payload means real execution risk
+DANGEROUS_CONTEXTS = {
+    "html_body",
+    "attribute_double",
+    "attribute_single",
+    "attribute_unquoted",
+    "js_string_single",
+    "js_string_double",
+    "js_string_template",
+    "js_code",
+}
+
+# Contexts that are inherently non-executable
+SAFE_EXECUTION_CONTEXTS = {
+    "html_comment",
+    "css",
+    "title",
+    "textarea",
 }
 
 # Context families for payload routing
 ATTR_FAMILY   = {"attribute_double", "attribute_single", "attribute_unquoted"}
 JS_STR_FAMILY = {"js_string_single", "js_string_double", "js_string_template"}
 
-# Categories that always apply regardless of context
 UNIVERSAL_CATEGORIES = {"polyglots"}
-
-# Categories that only make sense with certain transports
 FILE_UPLOAD_CATEGORY = "file_upload"
 HEADER_CATEGORY      = "header_injection"
-
-# Contexts that can't be injected into
-SAFE_CONTEXTS = {"not_reflected", "unknown_encoded"}
+SAFE_CONTEXTS        = {"not_reflected", "unknown_encoded"}
 
 
 # =============================================================================
 #  HELPERS
 # =============================================================================
 def _substitute(payload, attacker, alert_payload, target):
-    """Fallback substitution for non-OOB placeholders."""
     return (payload
             .replace("{{ATTACKER}}", attacker)
             .replace("{{TARGET}}", target)
@@ -112,12 +127,10 @@ def _substitute(payload, attacker, alert_payload, target):
 
 
 def _make_marker():
-    """Unique marker unlikely to appear naturally in a response."""
     return f"HU9INN_{uuid.uuid4().hex[:12]}_MARK"
 
 
 def _count_unescaped(text, char):
-    """Count occurrences of `char` not preceded by a backslash."""
     n = 0
     i = 0
     while i < len(text):
@@ -131,7 +144,6 @@ def _count_unescaped(text, char):
 
 
 def _find_marker(body, marker):
-    """Locate the marker in the body. Returns (index, encoding, snippet)."""
     if not body or not marker:
         return -1, None, ""
 
@@ -158,13 +170,50 @@ def _find_marker(body, marker):
 
 
 def _response_snippet(body, needle, window=160):
-    """Return a ~320 char window around the first occurrence of `needle`."""
-    if not body or not needle:
+    if not body:
         return ""
+    if not needle:
+        return body[:window * 2]
     idx = body.find(needle)
     if idx == -1:
         return body[:window * 2]
     return body[max(0, idx - window): idx + len(needle) + window]
+
+
+def _payload_variants(payload):
+    """
+    Return every form of the payload that might legitimately appear in the
+    response, given different server-side decoding behaviors.
+    """
+    variants = set()
+    if not payload:
+        return variants
+
+    variants.add(payload)
+
+    # URL-decoded variant — for URL-encoded payloads that the server decodes
+    try:
+        decoded = unquote(payload)
+        if decoded and decoded != payload:
+            variants.add(decoded)
+    except Exception:
+        pass
+
+    # HTML-decoded variant — for payloads sent with HTML entities
+    try:
+        html_decoded = (payload
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+            .replace("&quot;", '"')
+            .replace("&#39;", "'")
+            .replace("&#x27;", "'"))
+        if html_decoded != payload:
+            variants.add(html_decoded)
+    except Exception:
+        pass
+
+    return variants
 
 
 # =============================================================================
@@ -177,11 +226,9 @@ def detect_context(html, marker_idx):
     before = html[:marker_idx].lower()
     before_orig = html[:marker_idx]
 
-    # HTML comment
     if before.rfind("<!--") > before.rfind("-->"):
         return "html_comment"
 
-    # <script> block
     last_script_open  = before.rfind("<script")
     last_script_close = before.rfind("</script")
     if last_script_open > last_script_close:
@@ -191,23 +238,18 @@ def detect_context(html, marker_idx):
             js_before = js_before[gt_idx + 1:]
         return _classify_js_context(js_before)
 
-    # <style> block
     if before.rfind("<style") > before.rfind("</style"):
         return "css"
 
-    # <textarea>
     if before.rfind("<textarea") > before.rfind("</textarea"):
         return "textarea"
 
-    # <title>
     if before.rfind("<title") > before.rfind("</title"):
         return "title"
 
-    # <noscript>
     if before.rfind("<noscript") > before.rfind("</noscript"):
         return "noscript"
 
-    # Inside a tag (attribute context)
     last_lt = before.rfind("<")
     last_gt = before.rfind(">")
     if last_lt > last_gt:
@@ -248,18 +290,51 @@ def _classify_attribute_context(tag_fragment):
 
 
 # =============================================================================
-#  DANGEROUS MARKUP ANALYSIS
+#  DANGEROUS MARKUP ANALYSIS  (with counting)
 # =============================================================================
 def detect_dangerous_markup(body):
+    """
+    Return list of {pattern, match, count} for every dangerous pattern that
+    appears in `body`. Count is the number of occurrences — critical for
+    accurate delta comparisons.
+    """
     if not body:
         return []
-    hits, seen = [], set()
+    hits = []
     for regex, name in DANGEROUS_PATTERNS:
-        m = regex.search(body)
-        if m and name not in seen:
-            seen.add(name)
-            hits.append({"pattern": name, "match": m.group(0)[:120]})
+        matches = list(regex.finditer(body))
+        if matches:
+            hits.append({
+                "pattern": name,
+                "match": matches[0].group(0)[:120],
+                "count": len(matches),
+            })
     return hits
+
+
+def dangerous_markup_delta(baseline_body, current_body):
+    """
+    Return the list of dangerous patterns that appear MORE in the current
+    body than the baseline. This is the correct way to detect XSS-induced
+    markup changes — a page with <meta charset> in the baseline will not
+    produce a delta.
+    """
+    baseline = {m["pattern"]: m["count"]
+                for m in detect_dangerous_markup(baseline_body or "")}
+    current  = detect_dangerous_markup(current_body or "")
+
+    delta = []
+    for m in current:
+        base_count = baseline.get(m["pattern"], 0)
+        if m["count"] > base_count:
+            delta.append({
+                "pattern": m["pattern"],
+                "match": m["match"],
+                "count": m["count"],
+                "baseline_count": base_count,
+                "delta": m["count"] - base_count,
+            })
+    return delta
 
 
 # =============================================================================
@@ -268,7 +343,7 @@ def detect_dangerous_markup(body):
 class InjectionPoint:
     __slots__ = ("url", "method", "location", "name", "value",
                  "json_path", "json_body", "form_data", "extra_headers",
-                 "baseline_resp", "reflection")
+                 "baseline_resp", "baseline_body", "reflection")
 
     def __init__(self, url, method, location, name, value,
                  json_path=None, json_body=None, form_data=None,
@@ -283,6 +358,7 @@ class InjectionPoint:
         self.form_data = form_data
         self.extra_headers = extra_headers or {}
         self.baseline_resp = None
+        self.baseline_body = ""
         self.reflection = None
 
     def key(self):
@@ -484,10 +560,6 @@ def build_request(ip, payload, timeout=12, extra_headers=None,
 
 
 def build_curl(ip, payload, timeout=15):
-    """
-    Build a copy-pasteable cURL command that reproduces the finding.
-    Uses shlex.quote() for shell safety; the URL is already percent-encoded.
-    """
     parts = ["curl", "-sk", "--max-time", str(timeout), "-i"]
 
     if ip.location == "query":
@@ -542,11 +614,9 @@ def build_curl(ip, payload, timeout=15):
 
 
 # =============================================================================
-#  OOB POLLERS — LOCAL FILE + REMOTE CHECK.PHP
+#  OOB POLLERS
 # =============================================================================
 class LocalOOBPoller:
-    """Watches a local file for huginn-<token> lines."""
-
     def __init__(self, log_file, poll_interval=2.0, timeout=120.0):
         self.log_file = Path(log_file)
         self.poll_interval = poll_interval
@@ -596,11 +666,6 @@ class LocalOOBPoller:
 
 
 class RemoteOOBPoller:
-    """
-    Polls https://oast.beardedviking.org/check.php?list=1 for tokens.
-    Preferred when running against shared hosting.
-    """
-
     def __init__(self, base_url, poll_interval=4.0, timeout=180.0, verify=False):
         self.base_url = base_url.rstrip("/")
         self.poll_interval = poll_interval
@@ -652,7 +717,7 @@ class RemoteOOBPoller:
 
 
 # =============================================================================
-#  PLAYWRIGHT BROWSER VERIFICATION (optional)
+#  PLAYWRIGHT BROWSER VERIFICATION
 # =============================================================================
 def _verify_with_playwright(url, timeout_ms=6000):
     try:
@@ -686,7 +751,8 @@ def _verify_with_playwright(url, timeout_ms=6000):
 
             try:
                 page.goto(url, timeout=timeout_ms, wait_until="load")
-                page.wait_for_timeout(400)
+                # Allow deferred JS to fire (fetch, XHR, image beacons)
+                page.wait_for_timeout(800)
             except Exception:
                 pass
 
@@ -715,7 +781,8 @@ class XSSScanner:
                  use_browser=False,
                  oob_log_file=None,
                  oob_base_url=None,
-                 oob_timeout=120.0):
+                 oob_timeout=120.0,
+                 strict=False):
         self.program_dir = Path(program_dir)
         self.sites_root = Path(sites_root or (self.program_dir / "sites"))
         self.findings_root = self.program_dir / "findings" / "xss"
@@ -729,11 +796,11 @@ class XSSScanner:
         self.delay           = delay
         self.timeout         = timeout
         self.use_browser     = use_browser
+        self.strict          = strict
 
         self.seen_signatures = set()
         self._payloads = None
 
-        # ---- OOB poller selection ---------------------------------------
         self.oob_poller = None
         if oob_base_url:
             self.oob_poller = RemoteOOBPoller(oob_base_url, timeout=oob_timeout)
@@ -741,7 +808,7 @@ class XSSScanner:
             self.oob_poller = LocalOOBPoller(oob_log_file, timeout=oob_timeout)
 
     # ------------------------------------------------------------------ #
-    #  Payload loading & per-payload OOB substitution
+    #  Payload loading
     # ------------------------------------------------------------------ #
     def load_payloads(self):
         data = load_payloads("xss")
@@ -787,9 +854,6 @@ class XSSScanner:
     #  Payload routing
     # ------------------------------------------------------------------ #
     def filter_payloads_for_context(self, ctx, ip):
-        """
-        Two-stage filter: context must match AND transport must be capable.
-        """
         if ctx in SAFE_CONTEXTS:
             return []
 
@@ -798,23 +862,15 @@ class XSSScanner:
             category = entry.get("category", "")
             p_ctx    = entry.get("context", "")
 
-            # ---- Transport filtering ------------------------------------
-            # file_upload payloads only fire in file upload context;
-            # sending them as a query param won't produce a result.
             if category == FILE_UPLOAD_CATEGORY:
-                # Allow them against form fields (best-effort)
                 if ip.location not in ("body_form", "body_json"):
                     continue
 
-            # header_injection payloads are only worth sending against
-            # header/cookie injection points (or as form values that
-            # later get logged — allow form fields too)
             if category == HEADER_CATEGORY:
                 if ip.location not in ("header", "cookie", "body_form",
                                        "body_json", "query"):
                     continue
 
-            # ---- Context matching --------------------------------------
             if category in UNIVERSAL_CATEGORIES:
                 selected.append(entry); continue
 
@@ -836,18 +892,15 @@ class XSSScanner:
             if ctx.startswith("csp_") and p_ctx.startswith("csp_"):
                 selected.append(entry); continue
 
-            # Blind payloads apply wherever a sink might render
             if category == "blind":
                 selected.append(entry); continue
 
-            # Encoding / WAF / filter bypass payloads apply broadly
             if category in ("encoding", "waf_bypass", "filter_bypass",
                             "context_breaks"):
                 if ctx in ("html_body", "attribute_double", "attribute_single",
                            "attribute_unquoted", "js_code", "unknown"):
                     selected.append(entry); continue
 
-            # CSTI / PP payloads are context-agnostic within their family
             if category in ("csti", "prototype_pollution"):
                 if ctx in ("html_body", "attribute_double", "attribute_single",
                            "attribute_unquoted", "js_code", "unknown"):
@@ -856,13 +909,18 @@ class XSSScanner:
         return selected
 
     # ------------------------------------------------------------------ #
-    #  Baseline + reflection probe
+    #  Baseline + reflection
     # ------------------------------------------------------------------ #
     def capture_baseline(self, ip):
         try:
             ip.baseline_resp = build_request(ip, ip.value, timeout=self.timeout)
         except Exception:
             ip.baseline_resp = None
+
+        if ip.baseline_resp is not None:
+            ip.baseline_body = ip.baseline_resp.text or ""
+        else:
+            ip.baseline_body = ""
 
     def probe_reflection(self, ip):
         marker = _make_marker()
@@ -887,71 +945,112 @@ class XSSScanner:
         return ip.reflection
 
     # ------------------------------------------------------------------ #
-    #  Verification
+    #  VERIFICATION  — the core of the fix
     # ------------------------------------------------------------------ #
     def _verify(self, ip, payload_obj, resp):
         """
-        Multi-signal verification. Returns a hit dict or None.
+        Verify a response against a payload.
 
-        Priority order:
-          1. payload_survival  — the exact payload appears unmodified
-          2. dangerous_markup  — <script>, onerror=, javascript: present
-          3. reflection        — raw chars survive in dangerous context
+        Priority:
+          1. blind → OOB only (never markup-detect)
+          2. payload_survival — exact unmodified payload in dangerous context
+          3. dangerous_markup_delta — new/increased dangerous markup vs baseline
+          4. reflection — raw reflection in dangerous context (low severity)
         """
         if resp is None:
             return None
 
         body = resp.text or ""
         payload = payload_obj["payload"]
+        category = payload_obj.get("category", "")
 
-        # ---- 1. Exact payload survival --------------------------------
-        # Only check when the payload is fully present (some payloads get
-        # partially mangled by the target's HTML rendering).
-        # We trim trailing whitespace because some servers do.
-        trimmed = payload.strip()
-        if trimmed and trimmed in body:
-            # Now check it landed in a dangerous context
-            dangerous = detect_dangerous_markup(body)
-            ctx = (ip.reflection or {}).get("context", "unknown")
+        # ---- 0. Blind payloads NEVER check markup ---------------------
+        if category == "blind":
+            return None
+
+        ctx = (ip.reflection or {}).get("context", "unknown")
+        enc = (ip.reflection or {}).get("encoding", "unknown")
+
+        # ---- 1. Payload survival -------------------------------------
+        # Check the exact payload and its canonical decodings.
+        variants = _payload_variants(payload)
+        matched_variant = None
+        for v in variants:
+            v = v.strip()
+            if v and v in body:
+                matched_variant = v
+                break
+
+        if matched_variant:
+            delta = dangerous_markup_delta(ip.baseline_body, body)
+
+            # A payload surviving in a non-executable context is not XSS.
+            if ctx in SAFE_EXECUTION_CONTEXTS:
+                return {
+                    "verification_method": "payload_survival_safe_context",
+                    "severity": "low",
+                    "reason": f"Payload survived in {ctx} (non-executable)",
+                    "evidence": _response_snippet(body, matched_variant),
+                    "dangerous": delta,
+                    "payload_found": True,
+                }
+
+            if ctx in DANGEROUS_CONTEXTS:
+                # Two sub-cases: with or without markup delta.
+                # Payload survived in a dangerous context. The payload
+                # itself may not produce new markup patterns (e.g. a
+                # javascript: URI payload that only appears as text),
+                # so we trust the context + verbatim survival.
+                severity = "critical" if delta else "high"
+                return {
+                    "verification_method": "payload_survival",
+                    "severity": severity,
+                    "reason": (f"Payload survived unmodified in {ctx} context"
+                               + (" (with new markup)" if delta else "")),
+                    "evidence": _response_snippet(body, matched_variant),
+                    "dangerous": delta,
+                    "payload_found": True,
+                }
+
+            # Payload survived but reflection context is unknown/encoded.
             return {
-                "verification_method": "payload_survival",
-                "severity": "critical" if dangerous else "high",
-                "reason": f"Payload survived unmodified in {ctx} context",
-                "evidence": _response_snippet(body, trimmed),
-                "dangerous": dangerous,
+                "verification_method": "payload_survival_unknown_context",
+                "severity": "medium",
+                "reason": f"Payload survived but context unclear ({ctx})",
+                "evidence": _response_snippet(body, matched_variant),
+                "dangerous": delta,
                 "payload_found": True,
             }
 
-        # ---- 2. Dangerous markup ---------------------------------------
-        dangerous = detect_dangerous_markup(body)
-        if dangerous:
-            top_patterns = {d["pattern"] for d in dangerous}
-            critical_set = {"script_tag", "javascript_uri",
-                            "javascript_uri_quoted"}
-            sev = "critical" if top_patterns & critical_set else "high"
+        # ---- 2. Dangerous markup delta -------------------------------
+        delta = dangerous_markup_delta(ip.baseline_body, body)
+        if delta:
+            top_patterns = {d["pattern"] for d in delta}
+            critical_patterns = {"script_tag", "javascript_uri",
+                                 "javascript_uri_quoted", "svg_onload",
+                                 "meta_refresh"}
+            severity = "critical" if top_patterns & critical_patterns else "high"
+            top = delta[0]
             return {
-                "verification_method": "dangerous_markup",
-                "severity": sev,
-                "reason": f"Dangerous markup present: {sorted(top_patterns)}",
-                "evidence": dangerous[0]["match"],
-                "dangerous": dangerous,
+                "verification_method": "dangerous_markup_delta",
+                "severity": severity,
+                "reason": (f"New dangerous markup vs baseline: "
+                           f"{sorted(top_patterns)}"),
+                "evidence": top["match"][:200],
+                "dangerous": delta,
                 "payload_found": False,
             }
 
-        # ---- 3. Reflection heuristic -----------------------------------
-        if ip.reflection:
-            ctx = ip.reflection.get("context", "")
-            enc = ip.reflection.get("encoding", "")
-            if enc == "raw" and ctx in (ATTR_FAMILY | JS_STR_FAMILY |
-                                        {"html_body"}):
-                return {
-                    "verification_method": "reflection",
-                    "severity": "medium",
-                    "reason": f"Raw chars reflect in {ctx} (no execution yet)",
-                    "evidence": ip.reflection["snippet"][:200],
-                    "dangerous": [],
-                    "payload_found": False,
-                }
+        # ---- 3. Raw reflection (low confidence) ----------------------
+        if enc == "raw" and ctx in DANGEROUS_CONTEXTS:
+            return {
+                "verification_method": "reflection",
+                "severity": "low",
+                "reason": f"Raw reflection in {ctx} (no execution proven)",
+                "evidence": (ip.reflection.get("snippet") or "")[:200],
+                "dangerous": [],
+                "payload_found": False,
+            }
 
         return None
 
@@ -966,30 +1065,47 @@ class XSSScanner:
             return None
 
         hit = self._verify(ip, payload_obj, resp)
-
-        # OOB verification for blind payloads
         oob_confirmed = False
-        if (not hit or hit.get("verification_method") != "payload_survival"):
-            if (self.oob_poller and payload_obj.get("category") == "blind"
-                    and payload_obj.get("_token")):
-                # Give the target a moment to fire the callback
-                time.sleep(0.4)
-                if self.oob_poller.has_token(payload_obj["_token"]):
-                    oob_confirmed = True
-                    if not hit:
-                        hit = {
-                            "verification_method": "oob_callback",
-                            "severity": "confirmed",
-                            "reason": "Out-of-band callback received",
-                            "evidence": payload_obj.get("_oob_url", ""),
-                            "dangerous": [],
-                            "payload_found": False,
-                        }
-                    else:
-                        hit["verification_method"] = "oob_callback"
-                        hit["severity"] = "confirmed"
+
+        # ---- OOB confirmation for blind payloads ---------------------
+        # Blind payloads fire asynchronously. Wait briefly, then check.
+        if self.oob_poller and payload_obj.get("category") == "blind" \
+                and payload_obj.get("_token"):
+            time.sleep(0.5)
+            if self.oob_poller.has_token(payload_obj["_token"]):
+                oob_confirmed = True
+                hit = {
+                    "verification_method": "oob_callback",
+                    "severity": "confirmed",
+                    "reason": "Out-of-band callback received "
+                              "(blind XSS confirmed)",
+                    "evidence": payload_obj.get("_oob_url", ""),
+                    "dangerous": [],
+                    "payload_found": False,
+                }
+
+        # Also allow OOB confirmation for non-blind payloads that happen
+        # to hit the receiver (e.g. fetch()/beacon-based payloads that
+        # don't fit the blind category).
+        if not oob_confirmed and self.oob_poller \
+                and payload_obj.get("_token") \
+                and hit and hit.get("verification_method") == "payload_survival":
+            time.sleep(0.4)
+            if self.oob_poller.has_token(payload_obj["_token"]):
+                oob_confirmed = True
+                hit["verification_method"] = "oob_callback"
+                hit["severity"] = "confirmed"
+                hit["reason"] += " | OOB CONFIRMED"
 
         if not hit:
+            return None
+
+        # ---- Strict mode: drop non-executable findings --------------
+        if self.strict and hit["verification_method"] in (
+            "reflection",
+            "payload_survival_safe_context",
+            "payload_survival_unknown_context",
+        ):
             return None
 
         return self._build_finding(ip, payload_obj, hit, resp,
@@ -1038,6 +1154,9 @@ class XSSScanner:
             "response_length":   len(resp.text or "") if resp else None,
             "response_snippet":  _response_snippet(resp.text or "",
                                                    payload[:40] if payload else ""),
+            "baseline_status":   ip.baseline_resp.status_code
+                                 if ip.baseline_resp else None,
+            "baseline_length":   len(ip.baseline_body),
 
             "curl_command": build_curl(ip, payload),
 
@@ -1063,7 +1182,6 @@ class XSSScanner:
             ),
         }
 
-        # Dedup by URL+param+payload_id
         sig = hashlib.md5(
             f"{ip.url}|{ip.name}|{payload_obj.get('id')}".encode()
         ).hexdigest()
@@ -1071,7 +1189,6 @@ class XSSScanner:
             return None
         self.seen_signatures.add(sig)
 
-        # Persist
         host = urlparse(ip.url).netloc
         slug = safe_filename((urlparse(ip.url).path or "/").replace("/", "_")
                              or "_root")
@@ -1125,7 +1242,7 @@ class XSSScanner:
         }.get(cat, "reflected_xss")
 
     # ------------------------------------------------------------------ #
-    #  Process one injection point
+    #  Test one injection point
     # ------------------------------------------------------------------ #
     def test_point(self, ip):
         self.capture_baseline(ip)
@@ -1155,7 +1272,7 @@ class XSSScanner:
         return findings
 
     # ------------------------------------------------------------------ #
-    #  Browser verification pass
+    #  Browser verification
     # ------------------------------------------------------------------ #
     def verify_findings_with_browser(self, findings):
         if not self.use_browser or not findings:
@@ -1216,6 +1333,7 @@ class XSSScanner:
         log(f"alert    : {self.alert_payload}")
         log(f"browser  : {'enabled' if self.use_browser else 'disabled'}")
         log(f"OOB      : {'enabled' if self.oob_poller else 'disabled'}")
+        log(f"strict   : {'enabled' if self.strict else 'disabled'}")
 
         self.load_payloads()
         log(f"loaded {len(self._payloads)} payloads", "info")
@@ -1260,11 +1378,9 @@ class XSSScanner:
                     log(f"progress {done}/{total}  hits={len(all_findings)}",
                         "info")
 
-        # Browser verification
         if self.use_browser and all_findings:
             all_findings = self.verify_findings_with_browser(all_findings)
 
-        # OOB drain
         if self.oob_poller:
             log("waiting for final OOB callbacks…", "info")
             time.sleep(min(15, self.oob_poller.timeout))
@@ -1274,13 +1390,9 @@ class XSSScanner:
         section("XSS SCANNER :: COMPLETE")
         if all_findings:
             by_sev  = {}
-            by_ctx  = {}
             by_ver  = {}
             for f in all_findings:
                 by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
-                r = f.get("reflection") or {}
-                c = r.get("context", "unknown")
-                by_ctx[c] = by_ctx.get(c, 0) + 1
                 v = f.get("verification_method", "unknown")
                 by_ver[v] = by_ver.get(v, 0) + 1
             for s in ("confirmed", "critical", "high", "medium", "low"):
@@ -1297,19 +1409,17 @@ class XSSScanner:
                             for s in ("confirmed", "critical", "high",
                                       "medium", "low")},
             "by_subtype":   self._summarize(all_findings, "subtype"),
-            "by_context":   self._summarize_reflection_context(all_findings),
-            "by_category":  self._summarize(all_findings, "payload_category"),
             "by_verification": self._summarize(all_findings, "verification_method"),
             "attacker_domain": self.attacker_domain,
             "collab_host":     self.collab_host,
             "alert_payload":   self.alert_payload,
             "browser_used":    self.use_browser,
             "oob_enabled":     bool(self.oob_poller),
+            "strict_mode":     self.strict,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "findings": [
                 {"url": f["url"], "param": f["parameter"],
                  "severity": f["severity"], "subtype": f["subtype"],
-                 "context": (f.get("reflection") or {}).get("context"),
                  "verification": f.get("verification_method"),
                  "payload_name": f["payload_name"]}
                 for f in all_findings
@@ -1325,15 +1435,6 @@ class XSSScanner:
             out[k] = out.get(k, 0) + 1
         return out
 
-    @staticmethod
-    def _summarize_reflection_context(findings):
-        out = {}
-        for f in findings:
-            r = f.get("reflection") or {}
-            c = r.get("context", "unknown")
-            out[c] = out.get(c, 0) + 1
-        return out
-
 
 # =============================================================================
 #  ENTRY
@@ -1345,11 +1446,8 @@ def run(program_dir, sites_root=None,
         target_domain=None,
         use_browser=False,
         oob_log_file=None,
-        oob_base_url=None):
-    """
-    oob_base_url : e.g. "https://oast.beardedviking.org" — polls check.php?list=1
-    oob_log_file : local log file for interactsh-client style polling
-    """
+        oob_base_url=None,
+        strict=False):
     scanner = XSSScanner(
         program_dir=program_dir,
         sites_root=sites_root,
@@ -1360,6 +1458,7 @@ def run(program_dir, sites_root=None,
         use_browser=use_browser,
         oob_log_file=oob_log_file,
         oob_base_url=oob_base_url,
+        strict=strict,
     )
     return scanner.run()
 
@@ -1369,15 +1468,14 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="HUGINN XSS scanner")
     ap.add_argument("program_dir")
     ap.add_argument("--attacker", default=DEFAULT_ATTACKER)
-    ap.add_argument("--collab",   default=DEFAULT_COLLAB,
-                    help="OOB receiver host (default: oast.beardedviking.org)")
+    ap.add_argument("--collab",   default=DEFAULT_COLLAB)
     ap.add_argument("--alert",    default=DEFAULT_ALERT)
     ap.add_argument("--target",   default=None)
     ap.add_argument("--browser",  action="store_true")
-    ap.add_argument("--oob-log",  default=None,
-                    help="local collaborator log file (interactsh)")
-    ap.add_argument("--oob-url",  default=None,
-                    help="remote OOB base URL, e.g. https://oast.beardedviking.org")
+    ap.add_argument("--strict",   action="store_true",
+                    help="only report findings with execution proof")
+    ap.add_argument("--oob-log",  default=None)
+    ap.add_argument("--oob-url",  default=None)
     args = ap.parse_args()
     run(args.program_dir,
         attacker_domain=args.attacker,
@@ -1386,4 +1484,5 @@ if __name__ == "__main__":
         target_domain=args.target,
         use_browser=args.browser,
         oob_log_file=args.oob_log,
-        oob_base_url=args.oob_url)
+        oob_base_url=args.oob_url,
+        strict=args.strict)
