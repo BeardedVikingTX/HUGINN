@@ -1,0 +1,305 @@
+================================================================================
+                          HUGINN — ODIN'S RAVEN
+                     AUTOMATED SECURITY TESTING FRAMEWORK
+
+     Copyright (c) 2026 Bearded Viking Security Forge <legal@beardedviking.org>
+                        https://github.com/beardedviking/huginn
+
+--------------------------------------------------------------------------------
+                              MIT LICENSE
+--------------------------------------------------------------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+                        LEGAL DISCLAIMER AND TERMS OF USE
+================================================================================
+
+THIS DOCUMENT IS A LEGALLY BINDING AGREEMENT BETWEEN YOU ("USER",
+"LICENSEE", "YOU") AND BEARDED VIKING SECURITY FORGE AND ALL CONTRIBUTORS
+TO THE HUGINN PROJECT (COLLECTIVELY, "AUTHORS", "MAINTAINERS", "WE", "US").
+
+BY DOWNLOADING, INSTALLING, COPYING, EXECUTING, MODIFYING, DISTRIBUTING, OR
+OTHERWISE USING THE SOFTWARE KNOWN AS "HUGINN" (THE "SOFTWARE"), YOU
+ACKNOWLEDGE THAT YOU HAVE READ, UNDERSTOOD, AND AGREE TO BE BOUND BY EVERY
+PROVISION OF THIS DOCUMENT. IF YOU DO NOT AGREE, YOU MUST IMMEDIATELY CEASE
+ALL USE OF THE SOFTWARE AND DELETE ALL COPIES IN YOUR POSSESSION.
+
+--------------------------------------------------------------------------------
+1. PURPOSE AND INTENDED USE
+--------------------------------------------------------------------------------
+
+HUGINN is a security testing framework designed exclusively for:
+
+  (a) Authorized penetration testing engagements;
+  (b) Bug bounty programs conducted under published rules of engagement;
+  (c) Internal security audits performed on systems you own or control;
+  (d) Security research conducted with explicit written authorization from
+      the owner of every system tested;
+  (e) Educational use in controlled laboratory environments (e.g., DVWA,
+      OWASP WebGoat, PortSwigger Web Security Academy, HackTheBox,
+      TryHackMe, and similar deliberately vulnerable training platforms).
+
+Any use outside these categories is STRICTLY PROHIBITED.
+
+--------------------------------------------------------------------------------
+2. AUTHORIZATION REQUIREMENT
+--------------------------------------------------------------------------------
+
+You represent and warrant that, prior to using the Software against any
+system, network, application, or service:
+
+  (a) You have obtained EXPLICIT, DOCUMENTED, WRITTEN AUTHORIZATION from the
+      legitimate owner or operator of the target, specifying the scope of
+      testing, the timeframe, and the permitted activities;
+
+  (b) Your use complies with all applicable local, state, national, and
+      international laws, including but not limited to the Computer Fraud
+      and Abuse Act (18 U.S.C. § 1030) in the United States, the Computer
+      Misuse Act 1990 in the United Kingdom, the Cybercrime Convention
+      (Budapest Convention), the General Data Protection Regulation (EU)
+      2016/679, and any equivalent legislation in your jurisdiction;
+
+  (c) You will not use the Software to access, alter, damage, disable,
+      overload, or impair any system without authorization;
+
+  (d) You will respect the scope limitations, rate limits, and rules of
+      engagement of any bug bounty program, penetration testing contract,
+      or research agreement under which you operate.
+
+--------------------------------------------------------------------------------
+3. NO LIABILITY FOR MISUSE
+--------------------------------------------------------------------------------
+
+THE AUTHORS EXPRESSLY DISCLAIM ANY AND ALL LIABILITY FOR:
+
+  (a) Any unauthorized access, data breach, system damage, service disruption,
+      financial loss, or other harm caused by the use of this Software;
+
+  (b) Any legal action, criminal prosecution, civil litigation, administrative
+      penalty, fine, or regulatory sanction brought against any user;
+
+  (c) Any violation of law, contract, policy, or terms of service committed
+      by any user, whether intentional or unintentional;
+
+  (d) Any consequences arising from the user's failure to obtain proper
+      authorization, including but not limited to third-party claims,
+      indemnification demands, or reputational harm;
+
+  (e) Any inaccuracy, false positive, false negative, or misinterpretation
+      of results produced by the Software;
+
+  (f) Any use of the Software by third parties to whom the user has provided
+      access, whether with or without the user's knowledge.
+
+THE USER ACCEPTS FULL AND SOLE RESPONSIBILITY FOR THEIR ACTIONS AND THEIR
+CONSEQUENCES. THE AUTHORS ARE NOT YOUR LAWYERS, YOUR EMPLOYER, YOUR CLIENTS,
+YOUR AUTHORIZING PARTY, OR YOUR LEGAL DEFENSE. WE PROVIDE A TOOL, NOT A
+LICENSE TO BREAK THE LAW.
+
+--------------------------------------------------------------------------------
+4. INDEMNIFICATION
+--------------------------------------------------------------------------------
+
+You agree to INDEMNIFY, DEFEND, AND HOLD HARMLESS the Authors, their
+respective officers, directors, employees, agents, contributors, licensors,
+and successors from and against any and all claims, damages, losses,
+liabilities, costs, and expenses (including reasonable attorneys' fees)
+arising from or relating to:
+
+  (a) Your use or misuse of the Software;
+  (b) Your breach of any provision of this License;
+  (c) Your violation of any law, regulation, or third-party right;
+  (d) Any claim by a third party that your use of the Software caused harm.
+
+This indemnification obligation survives termination of this License and
+your cessation of use of the Software.
+
+--------------------------------------------------------------------------------
+5. WARRANTY DISCLAIMER
+--------------------------------------------------------------------------------
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED
+"AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF ANY KIND, EXPRESS, IMPLIED,
+STATUTORY, OR OTHERWISE. THE AUTHORS SPECIFICALLY DISCLAIM ALL WARRANTIES,
+INCLUDING BUT NOT LIMITED TO:
+
+  (a) THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+      PURPOSE, AND NON-INFRINGEMENT;
+
+  (b) ANY WARRANTY THAT THE SOFTWARE WILL BE ERROR-FREE, UNINTERRUPTED,
+      SECURE, ACCURATE, OR FREE OF HARMFUL COMPONENTS;
+
+  (c) ANY WARRANTY REGARDING THE RESULTS OBTAINED FROM USE OF THE SOFTWARE;
+
+  (d) ANY WARRANTY THAT DEFECTS IN THE SOFTWARE WILL BE CORRECTED.
+
+NO ORAL OR WRITTEN INFORMATION OR ADVICE GIVEN BY THE AUTHORS OR ANY
+REPRESENTATIVE SHALL CREATE A WARRANTY.
+
+--------------------------------------------------------------------------------
+6. LIMITATION OF LIABILITY
+--------------------------------------------------------------------------------
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+AUTHORS BE LIABLE FOR ANY:
+
+  (a) INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE
+      DAMAGES;
+
+  (b) LOSS OF PROFITS, REVENUE, DATA, USE, GOODWILL, OR OTHER INTANGIBLE
+      LOSSES;
+
+  (c) DAMAGES RESULTING FROM BUSINESS INTERRUPTION, PROCUREMENT OF
+      SUBSTITUTE GOODS OR SERVICES, OR THEFT OF DATA;
+
+  (d) DAMAGES RESULTING FROM UNAUTHORIZED ACCESS TO OR ALTERATION OF YOUR
+      TRANSMISSIONS OR DATA;
+
+WHETHER BASED ON WARRANTY, CONTRACT, TORT (INCLUDING NEGLIGENCE), STRICT
+LIABILITY, OR ANY OTHER LEGAL THEORY, AND WHETHER OR NOT THE AUTHORS HAVE
+BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+IN JURISDICTIONS THAT DO NOT ALLOW THE EXCLUSION OR LIMITATION OF LIABILITY
+FOR CONSEQUENTIAL OR INCIDENTAL DAMAGES, THE AUTHORS' LIABILITY SHALL BE
+LIMITED TO THE MAXIMUM EXTENT PERMITTED BY LAW. IN NO EVENT SHALL THE
+AGGREGATE LIABILITY OF THE AUTHORS EXCEED THE AMOUNT PAID BY YOU FOR THE
+SOFTWARE, WHICH FOR FREE DISTRIBUTION IS ZERO UNITED STATES DOLLARS ($0.00).
+
+--------------------------------------------------------------------------------
+7. EXPORT CONTROL AND SANCTIONS COMPLIANCE
+--------------------------------------------------------------------------------
+
+The Software may be subject to export control laws and economic sanctions
+regulations, including but not limited to the U.S. Export Administration
+Regulations (EAR), the International Traffic in Arms Regulations (ITAR), and
+sanctions administered by the U.S. Office of Foreign Assets Control (OFAC).
+
+You represent and warrant that:
+
+  (a) You are not located in, a resident of, or organized under the laws of
+      any country or territory subject to comprehensive U.S. sanctions
+      (including, without limitation, Cuba, Iran, North Korea, Syria, and
+      the Crimea, Donetsk, and Luhansk regions of Ukraine);
+
+  (b) You are not listed on any U.S. Government list of prohibited or
+      restricted parties (including the OFAC Specially Designated Nationals
+      List, the U.S. Department of Commerce Denied Persons List, or the
+      U.S. State Department Debarred List);
+
+  (c) You will not use the Software for any purpose prohibited by U.S. export
+      control laws, including the development or production of nuclear,
+      chemical, biological, or missile technologies, or military end uses.
+
+You are responsible for complying with all local laws regarding the import,
+export, and use of security testing tools in your jurisdiction.
+
+--------------------------------------------------------------------------------
+8. NO PROFESSIONAL ADVICE
+--------------------------------------------------------------------------------
+
+The Software does not provide legal advice, security consulting, compliance
+guidance, or professional services of any kind. The Authors are not acting as
+your attorney, your compliance officer, your security advisor, or your agent
+of any kind. Any information, output, or documentation provided by the
+Software is for informational purposes only and does not constitute a
+professional opinion.
+
+If you need legal advice regarding the legality of your testing activities,
+consult a qualified attorney licensed in your jurisdiction. If you need
+security consulting, engage a licensed professional.
+
+--------------------------------------------------------------------------------
+9. ACKNOWLEDGMENT OF RESPONSIBLE USE
+--------------------------------------------------------------------------------
+
+By using this Software, you acknowledge and agree that:
+
+  (a) Automated security testing generates significant network traffic and
+      may trigger security monitoring, intrusion detection, and incident
+      response systems on the target;
+
+  (b) Scanning systems without authorization is a criminal offense in most
+      jurisdictions and may result in severe penalties, including
+      imprisonment, fines, and permanent criminal records;
+
+  (c) The Authors actively encourage responsible disclosure of any security
+      vulnerabilities you discover through the use of this Software,
+      through appropriate channels (vendor security teams, coordinated
+      disclosure platforms, bug bounty programs);
+
+  (d) The Authors do not condone, encourage, or support any illegal,
+      unethical, or unauthorized use of this Software;
+
+  (e) You will use the Software only for legitimate, authorized, and
+      lawful security testing purposes;
+
+  (f) You will respect the privacy, data protection, and human rights of
+      all individuals whose systems, data, or communications you may
+      encounter in the course of using this Software.
+
+--------------------------------------------------------------------------------
+10. GOVERNING LAW AND DISPUTE RESOLUTION
+--------------------------------------------------------------------------------
+
+This License shall be governed by and construed in accordance with the laws
+of the State of Illinois, United States, without regard to its conflict of
+law provisions. Any dispute arising from or relating to this License or the
+Software shall be subject to the exclusive jurisdiction of the state and
+federal courts located in Illinois.
+
+If any provision of this License is held to be unenforceable or invalid,
+that provision shall be modified to the minimum extent necessary to make it
+enforceable, and the remaining provisions shall continue in full force and
+effect.
+
+--------------------------------------------------------------------------------
+11. MODIFICATION AND TERMINATION
+--------------------------------------------------------------------------------
+
+The Authors reserve the right to modify this License at any time. Continued
+use of the Software after a modification constitutes acceptance of the
+modified License.
+
+Your rights under this License terminate automatically if you breach any
+provision. Upon termination, you must immediately cease all use of the
+Software and destroy all copies in your possession.
+
+Provisions that by their nature should survive termination — including the
+indemnification, disclaimer of warranties, and limitation of liability
+sections — shall survive.
+
+--------------------------------------------------------------------------------
+12. ENTIRE AGREEMENT
+--------------------------------------------------------------------------------
+
+This document constitutes the entire agreement between you and the Authors
+regarding the Software and supersedes all prior or contemporaneous
+understandings. It does not modify or supersede any separate written
+agreement you may have with the Authors.
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================
+
+For licensing questions:  legal@beardedviking.org
+For security reports:     security@beardedviking.org
+For general inquiries:    contact@beardedviking.org
+
+Speak, and the ravens shall listen — but the ravens are not your lawyers.

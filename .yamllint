@@ -1,0 +1,31 @@
+# .yamllint
+---
+extends: default
+
+rules:
+  line-length:
+    max: 300
+    level: warning
+
+  document-start: disable
+
+  # Allow visual alignment padding after colons.
+  # Harmless — YAML parsers collapse it anyway.
+  colons:
+    max-spaces-after: -1   # -1 = unlimited
+
+  comments:
+    min-spaces-from-content: 1
+
+  truthy:
+    allowed-values: ['true', 'false', 'yes', 'no', 'on', 'off']
+
+  # Payload files legitimately contain long lines and multi-char strings
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+
+ignore: |
+  .venv/
+  output/
+  __pycache__/

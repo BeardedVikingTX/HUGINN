@@ -1,0 +1,43 @@
+# =============================================================================
+#  HUGINN :: .gitignore
+#  Everything that should NEVER be committed to the public repo.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  VIRTUAL ENVIRONMENTS — the big one
+# -----------------------------------------------------------------------------
+# Python virtualenvs are huge (~500MB-2GB) and machine-specific.
+# Never commit them. Every developer rebuilds with `python3 -m venv venv`.
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv.bak/
+virtualenv/
+virtualenvs/
+.conda/
+.miniconda/
+*.venv
+
+# Virtualenv internals (belt-and-braces — .gitignore doesn't recurse into
+# ignored dirs, but these catch stray fragments)
+pyvenv.cfg
+bin/activate
+bin/activate.csh
+bin/activate.fish
+bin/Activate.ps1
+Lib/site-packages/
+
+# -----------------------------------------------------------------------------
+#  PYTHON — bytecode, caches, build artifacts
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+
+

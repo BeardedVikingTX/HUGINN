@@ -1,0 +1,23 @@
+# =============================================================================
+#  HUGINN :: huginn.yaml
+#  Global configuration. CLI args override every field here.
+# =============================================================================
+
+# --- Attacker infrastructure -------------------------------------------------
+attacker_domain: beardedviking.org
+collab_host:     oast.beardedviking.org
+canary_host:     redirect.beardedviking.org
+canary_string:   HUGINN-CANARY-LANDED
+canary_check_url: https://redirect.beardedviking.org/check.php
+alert_payload:   alert(document.domain)
+
+# --- Out-of-band callback log (Burp Collaborator or Interactsh) -------------
+# Uncomment and set to enable blind XSS / SSRF confirmation.
+# oob_log_file: /var/log/huginn_oob.log
+
+# --- Scanner tuning ---------------------------------------------------------
+max_workers:  8
+delay:        0.15
+timeout:      12
+use_browser:  false
+provider_filter: null   # aws | gcp | azure | digitalocean | alibaba | oracle | kubernetes
