@@ -35,7 +35,7 @@
 #    python3 brain.py models           # list models for the active provider
 # =============================================================================
 
-from __future__ import annotations
+# from __future__ import annotations
 
 import json
 import os
@@ -48,19 +48,31 @@ from pathlib import Path
 
 from huginn_utils import log, section, C, load_json, save_json, now_iso
 
-# ---- .env support -----------------------------------------------------------
+# ---- .env support (dotenv if present, inline fallback otherwise) ------------
+def _load_dotenv_inline(path):
+    """Minimal .env parser. Doesn't overwrite existing env vars."""
+    if not path.exists():
+        return
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception:
+        pass
+
+_env_file = Path(__file__).parent / ".env"
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent / ".env")
+    load_dotenv(_env_file)
 except ImportError:
-    pass
-
-try:
-    import requests
-except ImportError:
-    print("[!] requests is required: pip install requests")
-    sys.exit(2)
-
+    _load_dotenv_inline(_env_file)
 
 # =============================================================================
 #  PROVIDER REGISTRY
