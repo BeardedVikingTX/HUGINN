@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HUGINN :: burp_to_sites.py — v3.0
+HUGINN :: burp_to_sites.py — v3.1
 
 Convert a plain list of URLs (exported from Burp Suite, or curated by hand)
 into the sites/<host>/<slug>.json workspace format that HUGINN's scanners
 consume.
+
+NEW in v3.1:
+  · Session headers — reads workspace/headers/default.txt + per-host
+    overrides; every fetch is authenticated automatically
+  · Per-JSON "_fetch" block — audit trail of auth state and header names
+  · Per-JSON "_ai" block — provider, model, duration, timestamp, success
+  · --no-auth flag to disable header profiles for a single run
 
 NEW in v3.0:
   · AI page reconnaissance (--ai) — per-URL ethical-hacker analysis
@@ -14,7 +21,7 @@ NEW in v3.0:
   · Priority index — writes _ai_recon_index.json with scan order
   · Graceful degradation — works with or without brain.py
 
-Smart filtering (unchanged):
+Smart filtering:
   · Presets for common workflows (bugbounty, strict, api-only, none)
   · Host include/exclude regexes
   · Path include/exclude regexes
@@ -22,24 +29,23 @@ Smart filtering (unchanged):
   · CDN / static-asset skip by default
 
 Usage:
-    # Basic import (no AI, identical to v2)
+    # Basic import (no AI, but headers/ profiles are used if present)
     python3 burp_to_sites.py urls.txt workspace/
 
     # With AI reconnaissance on every fetched URL
     python3 burp_to_sites.py urls.txt workspace/ --ai
 
+    # Skip header profiles for one run (pure unauthenticated)
+    python3 burp_to_sites.py urls.txt workspace/ --no-auth
+
+    # Custom header profile directory
+    python3 burp_to_sites.py urls.txt workspace/ --headers-dir ./my_headers
+
     # Gentle on free-tier rate limits
     python3 burp_to_sites.py urls.txt workspace/ --ai --ai-workers 1
 
-    # Backfill AI on an existing workspace (no refetch)
-    python3 burp_to_sites.py urls.txt workspace/ --ai
-
     # Refetch everything (ignore existing files)
     python3 burp_to_sites.py urls.txt workspace/ --refresh
-
-    # Only *.roblox.com hosts, dry-run preview
-    python3 burp_to_sites.py urls.txt workspace/ \
-        --include-host "\\.roblox\\.com$" --dry-run
 
 Environment:
     BRAIN_MODE=off           Disable AI even if --ai is passed
@@ -59,8 +65,17 @@ from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
 
 from huginn_utils import (
     log, section, save_json, load_json, send_request,
-    safe_filename, format_duration, C,
+    safe_filename, format_duration, C, now_iso,
 )
+
+# ---- Optional HeaderJar (requires huginn_utils >= 2.1.0) --------------------
+try:
+    from huginn_utils import HeaderJar, mask_header_value
+    _HEADER_JAR_AVAILABLE = True
+except ImportError:
+    _HEADER_JAR_AVAILABLE = False
+    HeaderJar = None
+    mask_header_value = None
 
 # ---- Optional AI brain -------------------------------------------------------
 try:
@@ -112,7 +127,6 @@ PRESETS = {
     },
 }
 
-# Static asset extensions used for AI-skip logic
 STATIC_EXTENSIONS = re.compile(
     r"\.(js|mjs|css|map|png|jpg|jpeg|gif|svg|webp|ico|bmp|"
     r"woff|woff2|ttf|otf|eot|mp4|webm|mp3|wav|ogg|ogv|"
@@ -145,12 +159,18 @@ DEFAULT_WORKERS  = 8
 DEFAULT_AI_WORKERS = 2
 PROGRESS_EVERY   = 25
 
+# Headers we consider "authenticated" for auditing purposes
+AUTH_HEADER_NAMES = {
+    "authorization", "cookie", "x-api-key", "x-auth-token",
+    "x-csrf-token", "x-xsrf-token", "x-session-token",
+    "proxy-authorization", "x-amz-security-token", "x-goog-api-key",
+}
+
 
 # =============================================================================
 #  URL NORMALIZATION
 # =============================================================================
 def normalize_url(url):
-    """Strip fragments and tracking params."""
     try:
         p = urlparse(url)
     except Exception:
@@ -169,12 +189,10 @@ def normalize_url(url):
 
 
 def parse_url_line(line):
-    """Parse a single line from a Burp export or URL list."""
     line = line.strip()
     if not line or line.startswith("#"):
         return None
 
-    # Strip Burp "METHOD URL HTTP/1.1" format
     if line.startswith(("GET ", "POST ", "PUT ", "DELETE ",
                          "PATCH ", "HEAD ", "OPTIONS ", "CONNECT ", "TRACE ")):
         parts = line.split(" ", 2)
@@ -194,7 +212,6 @@ def parse_url_line(line):
 
 def load_urls(path, filter_pattern=None, include_host=None,
               exclude_host=None, include_path=None, exclude_path=None):
-    """Load, normalize, dedupe, and filter URLs. Returns (urls, stats)."""
     urls = []
     seen = set()
 
@@ -280,7 +297,6 @@ def slug_for_url(url):
 
 
 def is_static_url(url):
-    """True for obvious CDN / static-asset URLs — used by --ai-skip-static."""
     try:
         p = urlparse(url)
     except Exception:
@@ -300,7 +316,6 @@ def is_static_url(url):
 #  HTTP FETCH
 # =============================================================================
 def _categorize_error(exc_type_name, msg):
-    """Map an exception to a short reason string."""
     m = (msg or "").lower()
     if "timeout" in m or "timed out" in m:
         return "timeout"
@@ -313,6 +328,18 @@ def _categorize_error(exc_type_name, msg):
     if "connection reset" in m:
         return "reset"
     return "exception:{}".format(exc_type_name)
+
+
+def describe_fetch_headers(merged_headers):
+    """
+    Return (authenticated: bool, sorted_header_names: list).
+    Only header NAMES are returned — never values.
+    """
+    if not merged_headers:
+        return False, []
+    names = sorted(merged_headers.keys())
+    authenticated = any(n.lower() in AUTH_HEADER_NAMES for n in names)
+    return authenticated, names
 
 
 def fetch_page(url, timeout=FETCH_TIMEOUT, extra_headers=None):
@@ -334,7 +361,6 @@ def fetch_page(url, timeout=FETCH_TIMEOUT, extra_headers=None):
     if len(body) > MAX_BODY_BYTES:
         body = body[:MAX_BODY_BYTES]
 
-    # Cookie extraction
     cookies = {}
     sc = r.headers.get("Set-Cookie") or r.headers.get("set-cookie") or ""
     if sc:
@@ -343,7 +369,6 @@ def fetch_page(url, timeout=FETCH_TIMEOUT, extra_headers=None):
             if m:
                 cookies[m.group(1).strip()] = m.group(2).strip()
 
-    # Title extraction
     title = ""
     mt = re.search(r"<title[^>]*>([^<]{1,300})</title>", body, re.I)
     if mt:
@@ -367,7 +392,7 @@ def fetch_page(url, timeout=FETCH_TIMEOUT, extra_headers=None):
         "cookies":        cookies,
         "content":        body,
         "_source":        "burp",
-        "_fetched_at":    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "_fetched_at":    now_iso(),
     }, None
 
 
@@ -386,7 +411,7 @@ def placeholder_page(url):
         "content":        "",
         "_source":        "burp_placeholder",
         "_note":          "no content captured — scanners will test URL params only",
-        "_fetched_at":    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "_fetched_at":    now_iso(),
     }
 
 
@@ -398,8 +423,8 @@ class FetchStats:
         self.total       = total
         self.written     = 0
         self.failed      = 0
-        self.skipped     = 0     # resume: already existed
-        self.refreshed   = 0     # resume: refetched
+        self.skipped     = 0
+        self.refreshed   = 0
         self.ai_done     = 0
         self.ai_failed   = 0
         self.ai_skipped  = 0
@@ -408,6 +433,8 @@ class FetchStats:
         self.ai_by_priority   = {}
         self.ai_scanner_hits  = {}
         self.error_reasons    = {}
+        self.authenticated    = 0
+        self.unauthenticated  = 0
         self.started_at  = time.time()
         self._lock       = threading.Lock()
 
@@ -418,6 +445,13 @@ class FetchStats:
     def record_error(self, reason):
         with self._lock:
             self.error_reasons[reason] = self.error_reasons.get(reason, 0) + 1
+
+    def record_auth(self, authenticated):
+        with self._lock:
+            if authenticated:
+                self.authenticated += 1
+            else:
+                self.unauthenticated += 1
 
     def record_ai(self, recon):
         with self._lock:
@@ -434,20 +468,22 @@ class FetchStats:
     def snapshot(self):
         with self._lock:
             return {
-                "total":          self.total,
-                "written":        self.written,
-                "failed":         self.failed,
-                "skipped":        self.skipped,
-                "refreshed":      self.refreshed,
-                "ai_done":        self.ai_done,
-                "ai_failed":      self.ai_failed,
-                "ai_skipped":     self.ai_skipped,
-                "ai_interesting": self.ai_interesting,
-                "ai_by_kind":     dict(self.ai_by_kind),
-                "ai_by_priority": dict(self.ai_by_priority),
-                "ai_scanner_hits": dict(self.ai_scanner_hits),
-                "error_reasons":  dict(self.error_reasons),
-                "elapsed_s":      round(time.time() - self.started_at, 1),
+                "total":             self.total,
+                "written":           self.written,
+                "failed":            self.failed,
+                "skipped":           self.skipped,
+                "refreshed":         self.refreshed,
+                "authenticated":     self.authenticated,
+                "unauthenticated":   self.unauthenticated,
+                "ai_done":           self.ai_done,
+                "ai_failed":         self.ai_failed,
+                "ai_skipped":        self.ai_skipped,
+                "ai_interesting":    self.ai_interesting,
+                "ai_by_kind":        dict(self.ai_by_kind),
+                "ai_by_priority":    dict(self.ai_by_priority),
+                "ai_scanner_hits":   dict(self.ai_scanner_hits),
+                "error_reasons":     dict(self.error_reasons),
+                "elapsed_s":         round(time.time() - self.started_at, 1),
             }
 
 
@@ -477,7 +513,7 @@ class HostThrottle:
 #  WORKER
 # =============================================================================
 def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
-                 extra_headers, no_fetch, refresh,
+                 header_jar, fallback_headers, no_fetch, refresh,
                  brain, ai_semaphore, ai_force, ai_skip_static,
                  stats, out_lock, quiet):
     """
@@ -504,67 +540,118 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
 
     out_path = host_dir / "{}.json".format(slug)
 
-    # ----- Resume: existing file ------------------------------------------
+    # ----- Resume ---------------------------------------------------------
     record = None
     needs_save = False
     if out_path.exists() and not refresh:
         try:
             record = load_json(out_path)
-            # If existing record has no ai_recon and --ai is on, we backfill
             needs_ai = (brain is not None and brain.available()
                         and "ai_recon" not in record)
             if not needs_ai:
                 stats.bump("skipped")
                 return url, record.get("status", 0), "skipped"
         except Exception:
-            record = None  # corrupt file — refetch
+            record = None
 
+    # ----- Fetch ----------------------------------------------------------
     if record is None:
+        # Resolve headers for this specific URL
+        if header_jar is not None:
+            merged_headers = header_jar.headers_for(url)
+        else:
+            merged_headers = dict(fallback_headers or {})
+
+        authenticated, header_names = describe_fetch_headers(merged_headers)
+
         if no_fetch:
             record = placeholder_page(url)
             outcome = "placeholder"
         else:
             throttle.wait(host)
-            record, err = fetch_page(url, extra_headers=extra_headers)
+            record, err = fetch_page(url, extra_headers=merged_headers)
             if record is None:
                 stats.record_error(err or "unknown")
                 return url, 0, "error:{}".format(err or "unknown")
             outcome = "ok"
 
+        # Attach the _fetch audit block
+        record["_fetch"] = {
+            "authenticated": authenticated,
+            "header_names":  header_names,
+            "timestamp":     now_iso(),
+        }
+        stats.record_auth(authenticated)
+
         if refresh and out_path.exists():
             stats.bump("refreshed")
         needs_save = True
 
-    # ----- AI recon --------------------------------------------------------
+    # ----- AI recon -------------------------------------------------------
     if brain is not None and brain.available() and ai_semaphore is not None:
         skip_ai = False
         if ai_skip_static and is_static_url(url):
             skip_ai = True
             stats.bump("ai_skipped")
 
-        # Don't re-run if ai_recon already present and not forced
         if not skip_ai and not ai_force and "ai_recon" in record:
             skip_ai = True
             stats.bump("ai_skipped")
 
         if not skip_ai:
+            ai_t0 = time.time()
+            recon = None
             try:
                 with ai_semaphore:
                     recon = brain.recon_page(record, force=ai_force)
-                if recon:
-                    record["ai_recon"] = recon
-                    stats.record_ai(recon)
-                    needs_save = True
-                else:
-                    stats.bump("ai_failed")
+                ai_ok = recon is not None
             except Exception as e:
-                # AI must never break fetch
-                stats.bump("ai_failed")
+                ai_ok = False
                 if not quiet:
                     log("AI recon error for {}: {}: {}".format(
                         url[:80], type(e).__name__, e), "warn")
+            ai_duration_ms = int((time.time() - ai_t0) * 1000)
 
-    # ----- Save ------------------------------------------------------------
+            # Always write the _ai audit block when we attempted
+            record["_ai"] = {
+                "enabled":     True,
+                "ok":          ai_ok,
+                "provider":    brain.provider,
+                "model":       brain.model,
+                "model_label": brain.cfg["label"] if brain.cfg else None,
+                "duration_ms": ai_duration_ms,
+                "timestamp":   now_iso(),
+            }
+
+            if ai_ok:
+                record["ai_recon"] = recon
+                stats.record_ai(recon)
+            else:
+                stats.bump("ai_failed")
+            needs_save = True
+        else:
+            # Skipped — leave existing _ai block alone, or write a stub
+            if "_ai" not in record:
+                record["_ai"] = {
+                    "enabled":   True,
+                    "ok":        "ai_recon" in record,
+                    "provider":  brain.provider,
+                    "model":     brain.model,
+                    "model_label": brain.cfg["label"] if brain.cfg else None,
+                    "skipped":   True,
+                    "timestamp": now_iso(),
+                }
+                needs_save = True
+    else:
+        # Brain off — write an explicit disabled marker if not present
+        if "_ai" not in record:
+            record["_ai"] = {
+                "enabled":   False,
+                "timestamp": now_iso(),
+            }
+            needs_save = True
+
+    # ----- Save -----------------------------------------------------------
     if needs_save:
         try:
             with out_lock:
@@ -671,17 +758,12 @@ def print_ai_summary(stats, brain):
 
 
 def write_ai_index(workspace, results):
-    """
-    Write _ai_recon_index.json — a compact, priority-sorted index of pages
-    with AI recon, so the user can scan in optimal order.
-    """
     index = {
-        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "generated_at": now_iso(),
         "total":        len(results),
         "pages":        [],
     }
 
-    # Sort: high priority first, then interesting, then by kind
     priority_rank = {"high": 0, "medium": 1, "low": 2}
     results.sort(key=lambda r: (
         priority_rank.get(r.get("priority", "low"), 3),
@@ -710,7 +792,7 @@ def write_ai_index(workspace, results):
 # =============================================================================
 def build_parser():
     ap = argparse.ArgumentParser(
-        description="Burp URLs → HUGINN workspace (with optional AI recon)",
+        description="Burp URLs → HUGINN workspace (auth-aware, AI-optional)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Presets:
@@ -719,15 +801,20 @@ Presets:
   api-only   Only /api/ /v1/ /graphql paths
   none       No automatic filtering — raw import
 
+Header profiles:
+  workspace/headers/default.txt            applies to every host
+  workspace/headers/<host>.txt             applies to that host only
+  Supported formats: raw header lines, or a full Burp request block.
+
 Examples:
   python3 burp_to_sites.py urls.txt workspace/
   python3 burp_to_sites.py urls.txt workspace/ --ai
   python3 burp_to_sites.py urls.txt workspace/ --ai --ai-workers 1
-  python3 burp_to_sites.py urls.txt workspace/ --ai --ai-skip-static
+  python3 burp_to_sites.py urls.txt workspace/ --no-auth
+  python3 burp_to_sites.py urls.txt workspace/ --headers-dir ./sessions/prod
   python3 burp_to_sites.py urls.txt workspace/ --refresh
   python3 burp_to_sites.py urls.txt workspace/ --dry-run
   python3 burp_to_sites.py urls.txt workspace/ --stats-only
-  python3 burp_to_sites.py urls.txt workspace/ --cookie "session=abc"
 """,
     )
     ap.add_argument("urls_file", help="text file with one URL per line")
@@ -772,8 +859,13 @@ Examples:
                     help="suppress per-URL logs; show only progress and summary")
 
     # Authentication
+    ap.add_argument("--headers-dir", default=None,
+                    help="directory with header profiles "
+                         "(default: <workspace>/headers)")
+    ap.add_argument("--no-auth", action="store_true",
+                    help="ignore header profiles entirely (unauthenticated)")
     ap.add_argument("--cookie", default=None,
-                    help="Cookie header value for authenticated fetches")
+                    help="Cookie header value (CLI override, merged last)")
     ap.add_argument("--header", action="append", default=[],
                     help="extra header (repeatable): 'Name: value'")
 
@@ -926,13 +1018,56 @@ def main():
         (workspace / "sites").mkdir(parents=True, exist_ok=True)
         (workspace / "findings").mkdir(parents=True, exist_ok=True)
         (workspace / "recon").mkdir(parents=True, exist_ok=True)
+        (workspace / "headers").mkdir(parents=True, exist_ok=True)
     except Exception as e:
         log("cannot create workspace: {}: {}".format(type(e).__name__, e), "err")
         sys.exit(1)
 
-    extra_headers = parse_extra_headers(args.cookie, args.header)
+    # ---- Header profiles (session cookies, auth tokens, etc.) ----------
+    section("AUTHENTICATION")
+    cli_headers = parse_extra_headers(args.cookie, args.header)
+
+    if args.no_auth:
+        log("--no-auth set: skipping header profiles", "warn")
+        header_jar = None
+        fallback_headers = cli_headers
+    elif not _HEADER_JAR_AVAILABLE:
+        log("HeaderJar not available in huginn_utils — "
+            "upgrade to v2.1.0 or apply the merge patch", "warn")
+        log("continuing with CLI headers only (if any)", "info")
+        header_jar = None
+        fallback_headers = cli_headers
+    else:
+        headers_dir = (Path(args.headers_dir) if args.headers_dir
+                       else (workspace / "headers"))
+        try:
+            header_jar = HeaderJar(headers_dir, cli_headers=cli_headers)
+            header_jar.load()
+        except Exception as e:
+            log("failed to load header profiles: {}: {}".format(
+                type(e).__name__, e), "warn")
+            header_jar = None
+            fallback_headers = cli_headers
+        else:
+            profiles = header_jar.profiles_loaded()
+            if profiles:
+                log("header profiles loaded from {}".format(headers_dir), "ok")
+                for line in header_jar.describe().splitlines():
+                    log(line, "info", "HEADERS")
+                if cli_headers:
+                    log("+ {} CLI header(s) merged last".format(len(cli_headers)),
+                        "info")
+            else:
+                log("no header profiles found in {}".format(headers_dir), "info")
+                if cli_headers:
+                    log("using {} CLI header(s)".format(len(cli_headers)), "info")
+                else:
+                    log("unauthenticated fetch — scanners may miss bugs",
+                        "warn")
+            fallback_headers = cli_headers
 
     # ---- AI brain setup -------------------------------------------------
+    section("AI SETUP")
     brain = None
     ai_semaphore = None
 
@@ -964,6 +1099,8 @@ def main():
                 if args.ai_force:
                     log("AI force: ON (ignoring cache)", "info")
                 ai_semaphore = threading.Semaphore(max(1, args.ai_workers))
+    else:
+        log("AI recon: OFF (use --ai to enable)", "info")
 
     # ---- Write import metadata -----------------------------------------
     try:
@@ -973,14 +1110,23 @@ def main():
             "filters_applied":  {k: v for k, v in filters.items() if v},
             "load_stats":       stats_load,
             "total_urls":       len(urls),
-            "has_auth":         bool(extra_headers),
+            "auth": {
+                "enabled":      header_jar is not None,
+                "headers_dir":  (str(Path(args.headers_dir))
+                                 if args.headers_dir
+                                 else str(workspace / "headers")),
+                "profiles":     (header_jar.profiles_loaded()
+                                 if header_jar is not None else []),
+                "cli_header_names": sorted(cli_headers.keys()),
+                "no_auth_flag": args.no_auth,
+            },
             "ai_enabled":       brain is not None,
             "ai_provider":      brain.provider if brain else None,
             "ai_model":         brain.model if brain else None,
             "ai_workers":       args.ai_workers if brain else None,
             "refresh":          args.refresh,
             "no_fetch":         args.no_fetch,
-            "timestamp":        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "timestamp":        now_iso(),
         })
     except Exception as e:
         log("failed to write import metadata: {}: {}".format(
@@ -1002,21 +1148,19 @@ def main():
     out_lock = threading.Lock()
     progress = ProgressReporter(stats, len(urls), quiet=args.quiet)
 
-    ai_results = []       # for the priority index
+    ai_results = []
     ai_results_lock = threading.Lock()
 
     t0 = time.time()
 
     def handle_result(url, status, outcome):
-        """Central post-processing of a worker result."""
         if outcome == "skipped":
-            pass  # already counted inside worker
+            pass
         elif outcome.startswith("error:"):
             reason = outcome.split(":", 1)[1] if ":" in outcome else "unknown"
             if not args.quiet:
                 log("  ✗ [{}] {}".format(reason, url[:110]), "warn")
         else:
-            # success (ok / placeholder)
             if not args.quiet:
                 log("  [{}] {}".format(status, url[:110]), "ok",
                     urlparse(url).netloc)
@@ -1028,7 +1172,8 @@ def main():
             for u in urls:
                 fut = pool.submit(
                     fetch_worker, u, workspace, used_slugs, used_slugs_lock,
-                    throttle, extra_headers, args.no_fetch, args.refresh,
+                    throttle, header_jar, fallback_headers,
+                    args.no_fetch, args.refresh,
                     brain, ai_semaphore, args.ai_force, args.ai_skip_static,
                     stats, out_lock, args.quiet,
                 )
@@ -1054,13 +1199,11 @@ def main():
                 # Collect AI recon for priority index
                 if brain is not None and brain.available():
                     try:
-                        # Cheap re-load from disk (worker wrote it)
                         parsed = urlparse(url)
                         host = parsed.netloc.lower()
                         slug = slug_for_url(url)
                         fpath = (workspace / "sites" / safe_filename(host)
                                  / "{}.json".format(slug))
-                        # Collision-suffixed slug fallback
                         if not fpath.exists():
                             host_slugs = used_slugs.get(host, {})
                             for s, u2 in host_slugs.items():
@@ -1078,7 +1221,7 @@ def main():
                                 with ai_results_lock:
                                     ai_results.append(ar2)
                     except Exception:
-                        pass  # priority index is best-effort
+                        pass
 
     except KeyboardInterrupt:
         print()
@@ -1101,6 +1244,10 @@ def main():
         log("pages refreshed: {}".format(snap["refreshed"]), "info")
     if snap["failed"]:
         log("pages failed  : {}".format(snap["failed"]), "warn")
+
+    if snap["authenticated"] or snap["unauthenticated"]:
+        log("authenticated : {}  |  unauthenticated : {}".format(
+            snap["authenticated"], snap["unauthenticated"]), "info")
 
     if snap["error_reasons"]:
         reasons = sorted(snap["error_reasons"].items(), key=lambda x: -x[1])
@@ -1129,7 +1276,7 @@ def main():
     except Exception:
         final_meta = {}
     final_meta["final_stats"] = snap
-    final_meta["completed_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    final_meta["completed_at"] = now_iso()
     try:
         save_json(workspace / "_burp_import.json", final_meta)
     except Exception:
