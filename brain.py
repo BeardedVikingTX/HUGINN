@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-#  HUGINN :: brain.py — v1.1
-#  Provider-agnostic LLM interface with scanner-aware triage.
+#  HUGINN :: brain.py — v1.2
+#  Provider-agnostic LLM interface with capability-aware selection.
 # -----------------------------------------------------------------------------
-#  What's new in v1.1:
-#    · import requests FIX (the whole reason status showed OFF)
-#    · Non-silent probe / chat errors (logged, never swallowed)
-#    · TRIAGE_PROFILES — per-scanner system prompts
-#    · classify_page() — for burp_to_sites post-fetch tagging
-#    · available_providers() — for multi-provider consensus
+#  What's new in v1.2:
+#    · Capability cache — remembers which providers can actually CHAT
+#    · Chat validation during probe (catches 402 Insufficient Balance)
+#    · Runtime failover — 402/429/5xx demotes provider, retries on next
+#    · `brain.py providers` — full capability matrix with reasons
+#    · `brain.py reset-cache` — force fresh probes
 # =============================================================================
 
-# from __future__ import annotations  # disabled for Python 3.6 (shared host)
+# from __future__ import annotations  # disabled for Python 3.6
 
 import json
 import os
@@ -31,9 +31,11 @@ except ImportError:
     print("[!] requests is required: pip install requests")
     sys.exit(2)
 
-# ---- .env support (dotenv if present, inline fallback otherwise) ------------
+
+# =============================================================================
+#  .env LOADER
+# =============================================================================
 def _load_dotenv_inline(path):
-    """Minimal .env parser. Doesn't overwrite existing env vars."""
     if not path.exists():
         return
     try:
@@ -121,16 +123,8 @@ DEFAULT_PRIORITY = ["ollama", "deepseek", "groq", "huggingface"]
 
 
 # =============================================================================
-#  TRIAGE PROFILES  — per-scanner system prompts
+#  TRIAGE PROFILES
 # =============================================================================
-#  Each profile has:
-#    system  : the base instructions
-#    focus   : scanner-specific things the model should check
-#
-#  The `kind` argument to triage() picks the profile. If omitted, the brain
-#  looks at finding["type"] and falls back to "generic".
-# =============================================================================
-
 _TRIAGE_OUTPUT_RULES = (
     "\n\nRespond with ONLY a JSON object. No markdown, no code fences, no "
     "prose. Format:\n"
@@ -261,7 +255,6 @@ TRIAGE_PROFILES = {
 
 DEFAULT_TRIAGE = "generic"
 
-# Page classification (for burp_to_sites post-fetch tagging)
 CLASSIFY_SYSTEM = (
     "You are HUGINN's page classifier. Given a fetched page's metadata, "
     "decide if it is worth deep scanning.\n\n"
@@ -275,6 +268,81 @@ CLASSIFY_SYSTEM = (
     "WAF block pages, empty redirects, plain HTML with no inputs.\n"
     "- Never explain outside the JSON."
 )
+
+
+# =============================================================================
+#  CAPABILITY CACHE — remembers which providers can actually chat
+# =============================================================================
+_CAPABILITY_FILE = Path(__file__).parent / ".brain_capabilities.json"
+_CAPABILITY_TTL = float(os.environ.get("BRAIN_CAPABILITY_TTL", "3600"))
+
+
+class CapabilityCache:
+    """Disk-backed, TTL'd record of which providers are usable."""
+
+    def __init__(self, path=None, ttl=None):
+        self.path = Path(path or _CAPABILITY_FILE)
+        self.ttl = float(ttl if ttl is not None else _CAPABILITY_TTL)
+        self._data = self._load()
+        self._lock = threading.Lock()
+
+    def _load(self):
+        try:
+            if self.path.exists():
+                with open(self.path, "r") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def _save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(self.path) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._data, f, indent=2)
+            os.replace(tmp, str(self.path))
+        except Exception:
+            pass
+
+    def get(self, slug):
+        with self._lock:
+            entry = self._data.get(slug)
+            if not entry:
+                return None
+            age = time.time() - float(entry.get("checked_at", 0))
+            if age > self.ttl:
+                return None
+            entry = dict(entry)
+            entry["age_s"] = round(age, 1)
+            return entry
+
+    def put(self, slug, usable, reason, model=None, base_url=None):
+        with self._lock:
+            self._data[slug] = {
+                "usable":     bool(usable),
+                "reason":     str(reason)[:200],
+                "model":      model,
+                "base_url":   base_url,
+                "checked_at": time.time(),
+            }
+            self._save()
+
+    def invalidate(self, slug):
+        with self._lock:
+            self._data.pop(slug, None)
+            self._save()
+
+    def clear(self):
+        with self._lock:
+            self._data = {}
+            self._save()
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._data)
 
 
 # =============================================================================
@@ -366,10 +434,7 @@ class TriageCache:
 #  BRAIN
 # =============================================================================
 class Brain:
-    """
-    Provider-agnostic LLM interface with scanner-aware triage.
-    Never raises. Callers should check `available()` first.
-    """
+    """Provider-agnostic LLM interface with capability-aware selection."""
 
     def __init__(self, priority=None, mode=None, force_refresh=False):
         self._lock = threading.Lock()
@@ -388,6 +453,7 @@ class Brain:
             max_cost_usd=float(os.environ.get("BRAIN_MAX_COST_USD", "0.50")),
         )
         self.cache = TriageCache()
+        self.cap = CapabilityCache()
 
         self._priority = priority or [
             p.strip().lower()
@@ -405,10 +471,14 @@ class Brain:
     def _detect(self, force=False):
         if not force and self.provider:
             return
+
         mode = self._mode_hint
-        priority = self._priority
+        priority = list(self._priority)
+
         if mode == "off":
-            self.mode = "off"; self.provider = None; return
+            self.mode = "off"
+            self.provider = None
+            return
         if mode == "local":
             priority = [p for p in priority if PROVIDERS[p]["kind"] == "local"]
         elif mode == "full":
@@ -418,24 +488,52 @@ class Brain:
             cfg = PROVIDERS.get(slug)
             if not cfg:
                 continue
-            if self._probe(slug, cfg):
-                self.provider = slug
-                self.cfg = cfg
-                self.mode = "local" if cfg["kind"] == "local" else "full"
+            result = self._probe(slug, cfg, force=force)
+            if result["usable"]:
+                self._apply_active(slug, cfg, result)
                 return
+
         self.mode = "off"
         self.provider = None
 
-    def _probe(self, slug, cfg):
-        key = None
-        for env in cfg["key_envs"]:
-            v = os.environ.get(env, "").strip()
-            if v:
-                key = v
-                break
-        if cfg["kind"] == "cloud" and not key:
-            return False
+    def _apply_active(self, slug, cfg, result):
+        with self._lock:
+            self.provider = slug
+            self.cfg = cfg
+            self.mode = "local" if cfg["kind"] == "local" else "full"
+            self.base_url = result.get("base_url")
+            self.model = result.get("model")
+            self.key = result.get("key")
+            self.models = result.get("model_ids") or []
 
+    def _probe(self, slug, cfg, force=False):
+        """
+        Return dict:
+            {"usable": bool, "reason": str, "model": str,
+             "base_url": str, "key": str|None, "model_ids": [...]}
+        """
+        # 0. Cache lookup (unless forced)
+        if not force:
+            cached = self.cap.get(slug)
+            if cached is not None:
+                return {
+                    "usable":    cached.get("usable", False),
+                    "reason":    cached.get("reason", "cached"),
+                    "model":     cached.get("model"),
+                    "base_url":  cached.get("base_url"),
+                    "key":       self._key_for(cfg),
+                    "model_ids": [],
+                    "from_cache": True,
+                }
+
+        # 1. Key check
+        key = self._key_for(cfg)
+        if cfg["kind"] == "cloud" and not key:
+            self.cap.put(slug, False, "no API key")
+            return {"usable": False, "reason": "no API key", "model": None,
+                    "base_url": None, "key": None, "model_ids": []}
+
+        # 2. Base URL + models endpoint
         base_url = os.environ.get(cfg["url_env"], cfg["default_url"]).rstrip("/")
         url = base_url + cfg["probe_path"]
         headers = {}
@@ -446,14 +544,20 @@ class Brain:
         try:
             r = requests.get(url, headers=headers, timeout=probe_timeout)
         except Exception as e:
-            log("probe {} failed: {}: {}".format(slug, type(e).__name__, e),
-                "debug", "BRAIN")
-            return False
-        if r.status_code != 200:
-            log("probe {} HTTP {}".format(slug, r.status_code),
-                "debug", "BRAIN")
-            return False
+            reason = "{}: {}".format(type(e).__name__, str(e)[:80])
+            log("probe {}: {}".format(slug, reason), "debug", "BRAIN")
+            self.cap.put(slug, False, reason)
+            return {"usable": False, "reason": reason, "model": None,
+                    "base_url": base_url, "key": key, "model_ids": []}
 
+        if r.status_code != 200:
+            reason = "models HTTP {}".format(r.status_code)
+            log("probe {}: {}".format(slug, reason), "debug", "BRAIN")
+            self.cap.put(slug, False, reason)
+            return {"usable": False, "reason": reason, "model": None,
+                    "base_url": base_url, "key": key, "model_ids": []}
+
+        # 3. Model selection
         model = os.environ.get(cfg["model_env"], cfg["default_model"]).strip()
         model_ids = self._parse_model_ids(slug, cfg, r)
         if model_ids and model not in model_ids:
@@ -461,12 +565,75 @@ class Brain:
             if fallback:
                 model = fallback
 
-        with self._lock:
-            self.base_url = base_url
-            self.model = model
-            self.key = key
-            self.models = model_ids
-        return True
+        # 4. Chat capability check — the critical step
+        do_chat = os.environ.get("BRAIN_PROBE_CHAT", "1") == "1"
+        if cfg["kind"] == "local":
+            do_chat = os.environ.get("BRAIN_PROBE_CHAT_LOCAL", "0") == "1"
+
+        if do_chat:
+            ok, reason = self._chat_capability_check(
+                slug, cfg, base_url, key, model)
+            if not ok:
+                log("probe {}: chat failed: {}".format(slug, reason),
+                    "debug", "BRAIN")
+                self.cap.put(slug, False, reason, model=model, base_url=base_url)
+                return {"usable": False, "reason": reason, "model": model,
+                        "base_url": base_url, "key": key, "model_ids": model_ids}
+
+        self.cap.put(slug, True, "ok", model=model, base_url=base_url)
+        return {"usable": True, "reason": "ok", "model": model,
+                "base_url": base_url, "key": key, "model_ids": model_ids}
+
+    def _chat_capability_check(self, slug, cfg, base_url, key, model):
+        """Make a tiny real chat call. Returns (ok: bool, reason: str)."""
+        url = base_url + cfg["chat_path"]
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = "Bearer " + key
+
+        body = {
+            "model":       model,
+            "messages":    [{"role": "user", "content": "ping"}],
+            "max_tokens":  4,
+            "temperature": 0.0,
+            "stream":      False,
+        }
+        timeout = float(os.environ.get("BRAIN_CHAT_PROBE_TIMEOUT", "20"))
+        try:
+            r = requests.post(url, headers=headers,
+                              data=json.dumps(body), timeout=timeout)
+        except Exception as e:
+            return False, "{}: {}".format(type(e).__name__, str(e)[:80])
+
+        if r.status_code == 200:
+            return True, "ok"
+
+        # Try to extract the API's error message
+        msg = ""
+        try:
+            payload = r.json()
+            if isinstance(payload, dict):
+                err = payload.get("error")
+                if isinstance(err, dict):
+                    msg = err.get("message", "")
+                elif isinstance(err, str):
+                    msg = err
+                if not msg:
+                    msg = payload.get("message", "")
+        except Exception:
+            pass
+        if not msg:
+            msg = r.text[:100]
+
+        return False, "HTTP {} {}".format(r.status_code, msg.strip()[:120])
+
+    @staticmethod
+    def _key_for(cfg):
+        for env in cfg["key_envs"]:
+            v = os.environ.get(env, "").strip()
+            if v:
+                return v
+        return None
 
     @staticmethod
     def _parse_model_ids(slug, cfg, resp):
@@ -513,22 +680,25 @@ class Brain:
     def available(self):
         return self.mode != "off" and self.provider is not None
 
-    def available_providers(self):
-        """Return list of slugs currently usable. Useful for consensus."""
+    def available_providers(self, force=False):
+        """Return list of slugs currently usable. Uses capability cache."""
         out = []
         for slug in self._priority:
             cfg = PROVIDERS.get(slug)
-            if cfg and self._probe(slug, cfg):
+            if not cfg:
+                continue
+            r = self._probe(slug, cfg, force=force)
+            if r["usable"]:
                 out.append(slug)
         return out
 
-    def refresh(self):
+    def refresh(self, force=True):
         with self._lock:
             self.provider = None
-        self._detect(force=True)
+        self._detect(force=force)
 
     def chat(self, messages, max_tokens=512, temperature=0.2,
-             json_mode=False, timeout=45):
+             json_mode=False, timeout=45, _retry=0):
         if not self.available():
             return None
         try:
@@ -558,12 +728,23 @@ class Brain:
         except Exception as e:
             log("brain chat error ({}): {}: {}".format(
                 self.provider, type(e).__name__, e), "warn", "BRAIN")
+            if _retry < 1:
+                return self._failover(messages, max_tokens, temperature,
+                                      json_mode, timeout, _retry)
             return None
 
         if r.status_code != 200:
             log("brain chat HTTP {} ({}): {}".format(
-                r.status_code, self.provider, r.text[:200]),
+                r.status_code, self.provider, r.text[:160]),
                 "warn", "BRAIN")
+            # Demote and retry once on next provider
+            if r.status_code in (401, 402, 403, 429, 500, 502, 503, 504):
+                if _retry < 1:
+                    self.cap.invalidate(self.provider)
+                    self.cap.put(self.provider, False,
+                                 "chat HTTP {}".format(r.status_code))
+                    return self._failover(messages, max_tokens, temperature,
+                                          json_mode, timeout, _retry)
             return None
 
         try:
@@ -581,6 +762,17 @@ class Brain:
         except Exception:
             return None
 
+    def _failover(self, messages, max_tokens, temperature, json_mode,
+                  timeout, _retry):
+        old = self.provider
+        self.refresh(force=False)
+        if not self.available() or self.provider == old:
+            return None
+        log("brain failover: {} -> {}".format(old, self.provider),
+            "info", "BRAIN")
+        return self.chat(messages, max_tokens, temperature, json_mode,
+                         timeout, _retry=_retry + 1)
+
     def _estimate_cost(self, tin, tout):
         rates = self.cfg.get("cost_per_mtok", (0.0, 0.0)) if self.cfg else (0.0, 0.0)
         return (tin / 1_000_000.0) * rates[0] + (tout / 1_000_000.0) * rates[1]
@@ -589,14 +781,6 @@ class Brain:
     #  Triage
     # ------------------------------------------------------------------ #
     def triage(self, finding, kind=None):
-        """
-        Triage a scanner finding.
-
-        kind: "sqli" | "xss" | "ssrf" | "open_redirect" | "path_traversal"
-              | "idor" | "generic" | None (auto-detect from finding["type"])
-
-        Returns dict or None if brain off / budget exceeded / parse failed.
-        """
         if not self.available():
             return None
 
@@ -641,14 +825,7 @@ class Brain:
         self.cache.put(ck, result)
         return result
 
-    # ------------------------------------------------------------------ #
-    #  Page classification (for burp_to_sites)
-    # ------------------------------------------------------------------ #
     def classify_page(self, page):
-        """
-        Given a fetched page record, decide if it's worth deep scanning.
-        Returns {"interesting": bool, "kind": str, "reason": str} or None.
-        """
         if not self.available():
             return None
         meta = {
@@ -703,7 +880,6 @@ class Brain:
         return None
 
     def embed(self, texts):
-        """RAG stub. Returns None until an embedder is wired in."""
         return None
 
     # ------------------------------------------------------------------ #
@@ -726,7 +902,6 @@ class Brain:
             "response_length":     f.get("response_length"),
             "baseline_length":     f.get("baseline_length"),
             "response_snippet":    (f.get("response_snippet") or "")[:800],
-            # xss / ssrf / open_redirect specific fields, if present
             "reflection_context":  f.get("reflection_context"),
             "redirect_target":     f.get("redirect_target"),
             "oob_hit":             f.get("oob_hit"),
@@ -787,7 +962,7 @@ def get_brain(priority=None, mode=None, refresh=False):
 
 
 # =============================================================================
-#  CLI (unchanged from v1.0, plus a quick smoke test)
+#  CLI
 # =============================================================================
 def _cmd_status():
     b = get_brain()
@@ -810,6 +985,38 @@ def _cmd_status():
         bud["cost_usd"], bud["max_cost"]))
     print()
     return 0 if st["mode"] != "off" else 1
+
+
+def _cmd_providers():
+    b = get_brain()
+    force = os.environ.get("BRAIN_PROBE_FORCE", "") == "1"
+
+    print()
+    print("{}HUGINN :: provider capability matrix{}".format(C.CY + C.B, C.R))
+    print("{}{}{}".format(C.D, "─" * 90, C.R))
+    print("  {:<14} {:<10} {:<10} {:<44} {}".format(
+        "provider", "reachable", "usable", "reason", "model"))
+    print("{}{}{}".format(C.D, "─" * 90, C.R))
+
+    for slug in b._priority:
+        cfg = PROVIDERS.get(slug)
+        if not cfg:
+            continue
+        r = b._probe(slug, cfg, force=force)
+        reach = "yes" if r.get("base_url") else "no"
+        usable = "yes" if r["usable"] else "no"
+        reason = r["reason"][:42]
+        model = (r.get("model") or "—")[:40]
+        color = C.GR if r["usable"] else C.RE
+        print("  {:<14} {:<10} {}{:<10}{} {:<44} {}".format(
+            slug, reach, color, usable, C.R, reason, model))
+    print()
+    print("{}({}) Capability cache: {}".format(
+        C.D, "forced re-probe" if force else "using cache",
+        b.cap.path))
+    print("Set BRAIN_PROBE_FORCE=1 to force a fresh probe.{}".format(C.R))
+    print()
+    return 0 if b.available() else 1
 
 
 def _cmd_test():
@@ -864,30 +1071,35 @@ def _cmd_triage(path, kind=None):
     return 0
 
 
+def _cmd_reset_cache():
+    b = get_brain()
+    b.cap.clear()
+    log("capability cache cleared", "ok", "BRAIN")
+    return 0
+
+
 def _cli():
     import argparse
     ap = argparse.ArgumentParser(prog="brain")
     sub = ap.add_subparsers(dest="cmd")
-    sub.add_parser("status", help="show provider / budget status")
-    sub.add_parser("test",   help="send a hello message")
-    sub.add_parser("models", help="list models for the active provider")
-    sub.add_parser("providers", help="list all currently usable providers")
+    sub.add_parser("status",   help="show active provider / budget")
+    sub.add_parser("providers", help="capability matrix for all providers")
+    sub.add_parser("test",     help="send a hello message")
+    sub.add_parser("models",   help="list models for the active provider")
+    sub.add_parser("reset-cache", help="clear the capability cache")
     p_t = sub.add_parser("triage", help="triage a finding JSON file")
     p_t.add_argument("file")
     p_t.add_argument("--kind", default=None,
                      help="force scanner profile (sqli|xss|ssrf|...)")
-    sub.add_parser("reset",  help="clear singleton")
+    sub.add_parser("reset", help="clear singleton")
 
     args = ap.parse_args()
-    if args.cmd == "status":    return _cmd_status()
-    if args.cmd == "test":      return _cmd_test()
-    if args.cmd == "models":    return _cmd_models()
-    if args.cmd == "providers":
-        b = get_brain()
-        for s in b.available_providers():
-            print("  + {}".format(s))
-        return 0
-    if args.cmd == "triage":    return _cmd_triage(args.file, args.kind)
+    if args.cmd == "status":       return _cmd_status()
+    if args.cmd == "providers":    return _cmd_providers()
+    if args.cmd == "test":         return _cmd_test()
+    if args.cmd == "models":       return _cmd_models()
+    if args.cmd == "reset-cache":  return _cmd_reset_cache()
+    if args.cmd == "triage":       return _cmd_triage(args.file, args.kind)
     if args.cmd == "reset":
         global _BRAIN
         with _BRAIN_LOCK:
