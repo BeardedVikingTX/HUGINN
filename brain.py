@@ -1,41 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-#  HUGINN :: brain.py — v1.0
-#  Provider-agnostic LLM interface.
+#  HUGINN :: brain.py — v1.1
+#  Provider-agnostic LLM interface with scanner-aware triage.
 # -----------------------------------------------------------------------------
-#  Design goals:
-#    · One interface, many providers (Ollama, DeepSeek, Groq, HuggingFace)
-#    · Auto-detect what's available at startup; fall back gracefully
-#    · NEVER raise — if no provider is usable, callers get None and continue
-#    · Budget-aware — cap calls / tokens / seconds / USD per session
-#    · Thread-safe — scanners use ThreadPoolExecutor
-#    · Cache identical triage calls to avoid paying twice
-#
-#  States:
-#    full   — a cloud API key is present and reachable
-#    local  — Ollama is reachable on localhost:11434
-#    off    — nothing available; AI hooks become no-ops
-#
-#  Provider priority (override via BRAIN_PRIORITY in .env):
-#    ollama, deepseek, groq, huggingface
-#
-#  Usage:
-#    from brain import get_brain
-#    brain = get_brain()
-#    if brain.available():
-#        verdict = brain.triage(finding)
-#        if verdict and verdict["verdict"] == "FALSE_POSITIVE":
-#            return
-#
-#  CLI:
-#    python3 brain.py status           # show what's available
-#    python3 brain.py test             # send a hello message
-#    python3 brain.py triage FILE      # triage a finding JSON
-#    python3 brain.py models           # list models for the active provider
+#  What's new in v1.1:
+#    · import requests FIX (the whole reason status showed OFF)
+#    · Non-silent probe / chat errors (logged, never swallowed)
+#    · TRIAGE_PROFILES — per-scanner system prompts
+#    · classify_page() — for burp_to_sites post-fetch tagging
+#    · available_providers() — for multi-provider consensus
 # =============================================================================
 
-from __future__ import annotations
+# from __future__ import annotations  # disabled for Python 3.6 (shared host)
 
 import json
 import os
@@ -47,6 +24,12 @@ import threading
 from pathlib import Path
 
 from huginn_utils import log, section, C, load_json, save_json, now_iso
+
+try:
+    import requests
+except ImportError:
+    print("[!] requests is required: pip install requests")
+    sys.exit(2)
 
 # ---- .env support (dotenv if present, inline fallback otherwise) ------------
 def _load_dotenv_inline(path):
@@ -74,19 +57,20 @@ try:
 except ImportError:
     _load_dotenv_inline(_env_file)
 
+
 # =============================================================================
 #  PROVIDER REGISTRY
 # =============================================================================
 PROVIDERS = {
     "ollama": {
         "label":         "Ollama (local)",
-        "key_envs":      [],                               # no key needed
+        "key_envs":      [],
         "url_env":       "OLLAMA_BASE_URL",
         "model_env":     "OLLAMA_MODEL",
         "default_url":   "http://localhost:11434",
         "default_model": "qwen2.5:14b-instruct",
-        "models_path":   "/api/tags",                      # native Ollama
-        "chat_path":     "/v1/chat/completions",           # OpenAI-compat shim
+        "models_path":   "/api/tags",
+        "chat_path":     "/v1/chat/completions",
         "probe_path":    "/api/tags",
         "kind":          "local",
         "cost_per_mtok": (0.0, 0.0),
@@ -135,27 +119,161 @@ PROVIDERS = {
 
 DEFAULT_PRIORITY = ["ollama", "deepseek", "groq", "huggingface"]
 
-# Triage system prompt — tight, format-locked, no room for prose.
-TRIAGE_SYSTEM = (
-    "You are HUGINN's triage engine. You analyze security-scanner findings "
-    "and decide whether they are real vulnerabilities or false positives.\n\n"
-    "Respond with ONLY a JSON object. No markdown, no code fences, no "
-    "explanation outside the JSON. Format:\n"
+
+# =============================================================================
+#  TRIAGE PROFILES  — per-scanner system prompts
+# =============================================================================
+#  Each profile has:
+#    system  : the base instructions
+#    focus   : scanner-specific things the model should check
+#
+#  The `kind` argument to triage() picks the profile. If omitted, the brain
+#  looks at finding["type"] and falls back to "generic".
+# =============================================================================
+
+_TRIAGE_OUTPUT_RULES = (
+    "\n\nRespond with ONLY a JSON object. No markdown, no code fences, no "
+    "prose. Format:\n"
     '{"verdict": "REAL" | "FALSE_POSITIVE" | "UNCERTAIN", '
     '"confidence": <float 0.0-1.0>, "reason": "<one sentence>"}\n\n'
     "Rules:\n"
     "- REAL: evidence clearly indicates a genuine vulnerability.\n"
-    "- FALSE_POSITIVE: normal error page, generic 403/404, WAF block, or "
-    "detector matched baseline noise.\n"
-    "- UNCERTAIN: needs manual review; you cannot decide from the evidence.\n"
-    "- Never explain outside the JSON. Never add fields. Never wrap in prose."
+    "- FALSE_POSITIVE: normal error, generic 403/404, WAF block, baseline "
+    "noise, or verification_method that does not confirm exploitation.\n"
+    "- UNCERTAIN: cannot decide from evidence alone; manual review needed.\n"
+    "- Never explain outside the JSON. Never add fields."
 )
 
-SUGGEST_SYSTEM = (
-    "You are HUGINN's orchestration advisor. Given the current scan state, "
-    "suggest the highest-value next actions.\n\n"
-    "Respond with ONLY a JSON array of short strings (1-5 items). "
-    "No markdown, no explanation."
+TRIAGE_PROFILES = {
+    "generic": {
+        "system": (
+            "You are HUGINN's security-finding triage engine. You receive "
+            "structured JSON from automated scanners and decide whether the "
+            "finding is a real vulnerability or a false positive."
+        ),
+        "focus": (
+            "Check: does the evidence actually demonstrate exploitation, or "
+            "does it show normal application behaviour? Is the baseline "
+            "sufficiently different from the payload response?"
+        ),
+    },
+    "sqli": {
+        "system": (
+            "You are HUGINN's SQL injection triage engine. You review SQLi "
+            "findings from automated scanners and reject false positives."
+        ),
+        "focus": (
+            "SQLi-specific checks:\n"
+            "- error_signature: does the matched error come from the payload, "
+            "not from the baseline response?\n"
+            "- timing_confirmed: was the delay >3x baseline stddev and "
+            "reproduced multiple times?\n"
+            "- boolean_pair: do TRUE and FALSE responses differ meaningfully "
+            "in length or content, and differ from baseline?\n"
+            "- status_escalation: 5xx with SQL-ish body counts as weak; "
+            "5xx without SQL-ish content is a false positive.\n"
+            "- body_diff: response growth alone is NOT SQLi evidence. Mark "
+            "UNCERTAIN at best unless other signals corroborate.\n"
+            "A generic 403, 404, or WAF block page is a FALSE POSITIVE."
+        ),
+    },
+    "xss": {
+        "system": (
+            "You are HUGINN's XSS triage engine. You review cross-site "
+            "scripting findings and reject false positives."
+        ),
+        "focus": (
+            "XSS-specific checks:\n"
+            "- Is the payload reflected unescaped in an executable context "
+            "(HTML body, attribute, script block, event handler)?\n"
+            "- Reflection in a JSON response with Content-Type: application/"
+            "json is not XSS unless the response is rendered as HTML.\n"
+            "- Payload inside an HTML-encoded context (&lt; &gt; &amp;) is "
+            "NOT XSS.\n"
+            "- Reflection in a 404 page with no browser execution context is "
+            "a FALSE POSITIVE.\n"
+            "- If the scanner used a headless browser and JS executed, that "
+            "is REAL with high confidence."
+        ),
+    },
+    "ssrf": {
+        "system": (
+            "You are HUGINN's SSRF triage engine. You review server-side "
+            "request forgery findings and reject false positives."
+        ),
+        "focus": (
+            "SSRF-specific checks:\n"
+            "- Did an out-of-band callback actually arrive at the collab "
+            "host, or is the finding based on response timing only?\n"
+            "- A response that echoes back the payload URL in a JSON/HTML "
+            "field is NOT SSRF.\n"
+            "- Internal IP access confirmed by response body content is REAL.\n"
+            "- Timing-only signals are UNCERTAIN at best.\n"
+            "- A 200 OK with no callback and no internal content is a FALSE "
+            "POSITIVE."
+        ),
+    },
+    "open_redirect": {
+        "system": (
+            "You are HUGINN's open-redirect triage engine. You review "
+            "redirect findings and reject false positives."
+        ),
+        "focus": (
+            "Open-redirect checks:\n"
+            "- Does the Location header point to an attacker-controlled host?\n"
+            "- Redirects to the same domain, to a whitelisted host, or to "
+            "relative paths are NOT open redirects.\n"
+            "- A meta-refresh or JS-based redirect to an attacker host IS a "
+            "real open redirect.\n"
+            "- HTTP 302 to a hardcoded login page is a FALSE POSITIVE."
+        ),
+    },
+    "path_traversal": {
+        "system": (
+            "You are HUGINN's path-traversal / LFI triage engine."
+        ),
+        "focus": (
+            "Path-traversal checks:\n"
+            "- Does the response contain actual file content (root:x:0:0 in "
+            "/etc/passwd, [extensions] in win.ini, etc.)?\n"
+            "- Reflected payload without file content is NOT traversal.\n"
+            "- Error messages mentioning filenames without content leakage "
+            "are UNCERTAIN.\n"
+            "- A 200 OK returning the requested page (SPA routing) is a "
+            "FALSE POSITIVE."
+        ),
+    },
+    "idor": {
+        "system": (
+            "You are HUGINN's IDOR / broken-access-control triage engine."
+        ),
+        "focus": (
+            "IDOR checks:\n"
+            "- Does the response actually return another user's data?\n"
+            "- A different resource ID returning 403/404 is NOT IDOR.\n"
+            "- A response that differs from baseline only in a user-ID "
+            "string is weak evidence.\n"
+            "- Confirmed unauthorised data retrieval (another user's PII, "
+            "orders, private objects) is REAL."
+        ),
+    },
+}
+
+DEFAULT_TRIAGE = "generic"
+
+# Page classification (for burp_to_sites post-fetch tagging)
+CLASSIFY_SYSTEM = (
+    "You are HUGINN's page classifier. Given a fetched page's metadata, "
+    "decide if it is worth deep scanning.\n\n"
+    'Respond with ONLY a JSON object: {"interesting": true|false, '
+    '"kind": "<login|api|admin|form|static|error|other>", '
+    '"reason": "<one sentence>"}\n\n'
+    "Rules:\n"
+    "- interesting=true for: login portals, admin panels, API endpoints, "
+    "forms with parameters, search pages, file uploads, user profiles.\n"
+    "- interesting=false for: marketing pages, static content, obvious 404s, "
+    "WAF block pages, empty redirects, plain HTML with no inputs.\n"
+    "- Never explain outside the JSON."
 )
 
 
@@ -167,15 +285,12 @@ class BudgetExceeded(Exception):
 
 
 class Budget:
-    """Per-session budget for LLM calls."""
-
     def __init__(self, max_calls=500, max_tokens=200_000,
                  max_seconds=1800.0, max_cost_usd=0.50):
         self.max_calls = int(max_calls)
         self.max_tokens = int(max_tokens)
         self.max_seconds = float(max_seconds)
         self.max_cost_usd = float(max_cost_usd)
-
         self.calls = 0
         self.tokens_in = 0
         self.tokens_out = 0
@@ -186,13 +301,13 @@ class Budget:
     def check(self, est_tokens=1000, est_cost=0.0):
         with self._lock:
             if self.calls + 1 > self.max_calls:
-                raise BudgetExceeded(f"call limit ({self.max_calls})")
+                raise BudgetExceeded("call limit ({})".format(self.max_calls))
             if self.tokens_in + self.tokens_out + est_tokens > self.max_tokens:
-                raise BudgetExceeded(f"token limit ({self.max_tokens})")
+                raise BudgetExceeded("token limit ({})".format(self.max_tokens))
             if time.time() - self.started_at > self.max_seconds:
-                raise BudgetExceeded(f"time limit ({self.max_seconds}s)")
+                raise BudgetExceeded("time limit ({})".format(self.max_seconds))
             if self.cost_usd + est_cost > self.max_cost_usd:
-                raise BudgetExceeded(f"cost limit (${self.max_cost_usd})")
+                raise BudgetExceeded("cost limit (${})".format(self.max_cost_usd))
 
     def record(self, tokens_in=0, tokens_out=0, cost_usd=0.0):
         with self._lock:
@@ -217,7 +332,7 @@ class Budget:
 
 
 # =============================================================================
-#  TRIAGE CACHE  (bounded LRU-ish)
+#  TRIAGE CACHE
 # =============================================================================
 class TriageCache:
     def __init__(self, max_size=1000):
@@ -226,11 +341,11 @@ class TriageCache:
         self._max = max_size
         self._lock = threading.Lock()
 
-    def key(self, finding):
-        raw = "|".join(str(finding.get(k, "")) for k in (
+    def key(self, finding, kind):
+        raw = "|".join([kind] + [str(finding.get(k, "")) for k in (
             "type", "subtype", "url", "parameter", "payload_id", "payload",
             "verification_method", "detection_reason",
-        ))
+        )])
         return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:32]
 
     def get(self, k):
@@ -252,10 +367,8 @@ class TriageCache:
 # =============================================================================
 class Brain:
     """
-    Provider-agnostic LLM interface.
-
-    Never raises. Callers should check `available()` before using, but
-    even if they don't, every method returns None on failure.
+    Provider-agnostic LLM interface with scanner-aware triage.
+    Never raises. Callers should check `available()` first.
     """
 
     def __init__(self, priority=None, mode=None, force_refresh=False):
@@ -292,14 +405,10 @@ class Brain:
     def _detect(self, force=False):
         if not force and self.provider:
             return
-
         mode = self._mode_hint
         priority = self._priority
-
         if mode == "off":
-            self.mode = "off"
-            self.provider = None
-            return
+            self.mode = "off"; self.provider = None; return
         if mode == "local":
             priority = [p for p in priority if PROVIDERS[p]["kind"] == "local"]
         elif mode == "full":
@@ -314,13 +423,10 @@ class Brain:
                 self.cfg = cfg
                 self.mode = "local" if cfg["kind"] == "local" else "full"
                 return
-
         self.mode = "off"
         self.provider = None
 
     def _probe(self, slug, cfg):
-        """Return True if this provider is usable right now."""
-        # 1. Key check (cloud providers only)
         key = None
         for env in cfg["key_envs"]:
             v = os.environ.get(env, "").strip()
@@ -330,27 +436,26 @@ class Brain:
         if cfg["kind"] == "cloud" and not key:
             return False
 
-        # 2. Base URL
         base_url = os.environ.get(cfg["url_env"], cfg["default_url"]).rstrip("/")
-
-        # 3. Probe
-        url = f"{base_url}{cfg['probe_path']}"
+        url = base_url + cfg["probe_path"]
         headers = {}
         if key:
-            headers["Authorization"] = f"Bearer {key}"
+            headers["Authorization"] = "Bearer " + key
+
+        probe_timeout = float(os.environ.get("BRAIN_PROBE_TIMEOUT", "10"))
         try:
-            r = requests.get(url, headers=headers, timeout=3)
-        except Exception:
+            r = requests.get(url, headers=headers, timeout=probe_timeout)
+        except Exception as e:
+            log("probe {} failed: {}: {}".format(slug, type(e).__name__, e),
+                "debug", "BRAIN")
             return False
         if r.status_code != 200:
+            log("probe {} HTTP {}".format(slug, r.status_code),
+                "debug", "BRAIN")
             return False
 
-        # 4. Model selection
         model = os.environ.get(cfg["model_env"], cfg["default_model"]).strip()
         model_ids = self._parse_model_ids(slug, cfg, r)
-
-        # Ollama: /api/tags shape is {"models":[{"name": "..."}]}
-        # Cloud: /v1/models shape is {"data":[{"id": "..."}]}
         if model_ids and model not in model_ids:
             fallback = self._pick_fallback(slug, model_ids)
             if fallback:
@@ -408,6 +513,15 @@ class Brain:
     def available(self):
         return self.mode != "off" and self.provider is not None
 
+    def available_providers(self):
+        """Return list of slugs currently usable. Useful for consensus."""
+        out = []
+        for slug in self._priority:
+            cfg = PROVIDERS.get(slug)
+            if cfg and self._probe(slug, cfg):
+                out.append(slug)
+        return out
+
     def refresh(self):
         with self._lock:
             self.provider = None
@@ -415,22 +529,18 @@ class Brain:
 
     def chat(self, messages, max_tokens=512, temperature=0.2,
              json_mode=False, timeout=45):
-        """
-        Low-level chat. Returns the assistant's string, or None on any error.
-        Honors the session budget.
-        """
         if not self.available():
             return None
         try:
             self.budget.check(est_tokens=max_tokens)
         except BudgetExceeded as e:
-            log(f"brain budget exceeded: {e}", "warn", "BRAIN")
+            log("brain budget exceeded: {}".format(e), "warn", "BRAIN")
             return None
 
-        url = f"{self.base_url}{self.cfg['chat_path']}"
+        url = self.base_url + self.cfg["chat_path"]
         headers = {"Content-Type": "application/json"}
         if self.key:
-            headers["Authorization"] = f"Bearer {self.key}"
+            headers["Authorization"] = "Bearer " + self.key
 
         body = {
             "model": self.model,
@@ -440,19 +550,20 @@ class Brain:
             "stream": False,
         }
         if json_mode:
-            # OpenAI-compatible response_format
             body["response_format"] = {"type": "json_object"}
 
         try:
             r = requests.post(url, headers=headers,
                               data=json.dumps(body), timeout=timeout)
         except Exception as e:
-            log(f"brain chat error ({self.provider}): {e}", "warn", "BRAIN")
+            log("brain chat error ({}): {}: {}".format(
+                self.provider, type(e).__name__, e), "warn", "BRAIN")
             return None
 
         if r.status_code != 200:
-            log(f"brain chat HTTP {r.status_code} ({self.provider}): "
-                f"{r.text[:200]}", "warn", "BRAIN")
+            log("brain chat HTTP {} ({}): {}".format(
+                r.status_code, self.provider, r.text[:200]),
+                "warn", "BRAIN")
             return None
 
         try:
@@ -463,8 +574,7 @@ class Brain:
         usage = data.get("usage") or {}
         tin = usage.get("prompt_tokens", 0) or 0
         tout = usage.get("completion_tokens", 0) or 0
-        cost = self._estimate_cost(tin, tout)
-        self.budget.record(tokens_in=tin, tokens_out=tout, cost_usd=cost)
+        self.budget.record(tin, tout, self._estimate_cost(tin, tout))
 
         try:
             return data["choices"][0]["message"]["content"]
@@ -476,28 +586,32 @@ class Brain:
         return (tin / 1_000_000.0) * rates[0] + (tout / 1_000_000.0) * rates[1]
 
     # ------------------------------------------------------------------ #
-    #  High-level helpers
+    #  Triage
     # ------------------------------------------------------------------ #
-    def triage(self, finding):
+    def triage(self, finding, kind=None):
         """
-        Ask the brain whether a finding is REAL / FALSE_POSITIVE / UNCERTAIN.
+        Triage a scanner finding.
 
-        Returns:
-            {"verdict": "...", "confidence": 0-1, "reason": "...",
-             "provider": "...", "model": "..."}
-        or None if the brain is off, budget exceeded, or parsing failed.
+        kind: "sqli" | "xss" | "ssrf" | "open_redirect" | "path_traversal"
+              | "idor" | "generic" | None (auto-detect from finding["type"])
+
+        Returns dict or None if brain off / budget exceeded / parse failed.
         """
         if not self.available():
             return None
 
-        ck = self.cache.key(finding)
+        kind = (kind or finding.get("type") or DEFAULT_TRIAGE).lower()
+        profile = TRIAGE_PROFILES.get(kind, TRIAGE_PROFILES[DEFAULT_TRIAGE])
+
+        ck = self.cache.key(finding, kind)
         cached = self.cache.get(ck)
         if cached:
             return cached
 
+        system_prompt = profile["system"] + "\n\n" + profile["focus"] + _TRIAGE_OUTPUT_RULES
         compact = self._compact_finding(finding)
         messages = [
-            {"role": "system", "content": TRIAGE_SYSTEM},
+            {"role": "system", "content": system_prompt},
             {"role": "user",   "content": json.dumps(compact, indent=2)},
         ]
         raw = self.chat(messages, max_tokens=256, temperature=0.0,
@@ -507,7 +621,7 @@ class Brain:
 
         parsed = self._parse_json_reply(raw)
         if not parsed or "verdict" not in parsed:
-            log(f"brain triage parse failed; raw={raw[:160]!r}",
+            log("brain triage parse failed; raw={!r}".format(raw[:160]),
                 "warn", "BRAIN")
             return None
 
@@ -519,6 +633,7 @@ class Brain:
             "verdict":    verdict,
             "confidence": float(parsed.get("confidence", 0.5) or 0.5),
             "reason":     str(parsed.get("reason", ""))[:280],
+            "kind":       kind,
             "provider":   self.provider,
             "model":      self.model,
             "timestamp":  now_iso(),
@@ -526,13 +641,55 @@ class Brain:
         self.cache.put(ck, result)
         return result
 
+    # ------------------------------------------------------------------ #
+    #  Page classification (for burp_to_sites)
+    # ------------------------------------------------------------------ #
+    def classify_page(self, page):
+        """
+        Given a fetched page record, decide if it's worth deep scanning.
+        Returns {"interesting": bool, "kind": str, "reason": str} or None.
+        """
+        if not self.available():
+            return None
+        meta = {
+            "url":            page.get("url"),
+            "status":         page.get("status"),
+            "content_type":   page.get("content_type"),
+            "content_length": page.get("content_length"),
+            "title":          (page.get("title") or "")[:200],
+            "params":         page.get("params", []),
+            "has_form":       "<form" in (page.get("content") or "").lower(),
+            "body_head":      (page.get("content") or "")[:1200],
+        }
+        messages = [
+            {"role": "system", "content": CLASSIFY_SYSTEM},
+            {"role": "user",   "content": json.dumps(meta, indent=2)},
+        ]
+        raw = self.chat(messages, max_tokens=128, temperature=0.0,
+                        json_mode=True)
+        if not raw:
+            return None
+        parsed = self._parse_json_reply(raw)
+        if not isinstance(parsed, dict) or "interesting" not in parsed:
+            return None
+        return {
+            "interesting": bool(parsed.get("interesting")),
+            "kind":        str(parsed.get("kind", "other"))[:32],
+            "reason":      str(parsed.get("reason", ""))[:200],
+            "provider":    self.provider,
+            "model":       self.model,
+        }
+
     def suggest_next(self, context):
-        """Return a list of suggested next actions, or None."""
         if not self.available():
             return None
         messages = [
-            {"role": "system", "content": SUGGEST_SYSTEM},
-            {"role": "user",   "content": json.dumps(context, indent=2)},
+            {"role": "system",
+             "content": ("You are HUGINN's orchestration advisor. Given the "
+                         "current scan state, suggest the highest-value next "
+                         "actions. Respond with ONLY a JSON array of short "
+                         "strings (1-5 items). No markdown.")},
+            {"role": "user", "content": json.dumps(context, indent=2)},
         ]
         raw = self.chat(messages, max_tokens=200, temperature=0.3,
                         json_mode=True)
@@ -546,10 +703,7 @@ class Brain:
         return None
 
     def embed(self, texts):
-        """
-        Stub for RAG. Returns None until a local embedder or a cloud
-        embedding provider is wired in. Callers must handle None.
-        """
+        """RAG stub. Returns None until an embedder is wired in."""
         return None
 
     # ------------------------------------------------------------------ #
@@ -572,22 +726,23 @@ class Brain:
             "response_length":     f.get("response_length"),
             "baseline_length":     f.get("baseline_length"),
             "response_snippet":    (f.get("response_snippet") or "")[:800],
+            # xss / ssrf / open_redirect specific fields, if present
+            "reflection_context":  f.get("reflection_context"),
+            "redirect_target":     f.get("redirect_target"),
+            "oob_hit":             f.get("oob_hit"),
         }
 
     @staticmethod
     def _parse_json_reply(raw):
-        """Strip fences, extract first JSON object/array, parse."""
         if not raw:
             return None
         s = raw.strip()
-        # Strip ```json ... ``` fences
         s = re.sub(r"^```(?:json)?\s*", "", s)
         s = re.sub(r"\s*```$", "", s)
         try:
             return json.loads(s)
         except Exception:
             pass
-        # Fallback: grab first {...} or [...]
         m = re.search(r"\{.*\}", s, re.S)
         if m:
             try:
@@ -602,9 +757,6 @@ class Brain:
                 pass
         return None
 
-    # ------------------------------------------------------------------ #
-    #  Diagnostics
-    # ------------------------------------------------------------------ #
     def status(self):
         return {
             "mode":     self.mode,
@@ -635,120 +787,107 @@ def get_brain(priority=None, mode=None, refresh=False):
 
 
 # =============================================================================
-#  CLI
+#  CLI (unchanged from v1.0, plus a quick smoke test)
 # =============================================================================
 def _cmd_status():
-    brain = get_brain()
-    st = brain.status()
-
+    b = get_brain()
+    st = b.status()
     print()
-    print(f"{C.CY}{C.B}HUGINN :: brain status{C.R}")
-    print(f"{C.D}{'─' * 60}{C.R}")
-
-    mode_color = {
-        "full":  C.GR,
-        "local": C.CY,
-        "off":   C.RE,
-    }.get(st["mode"], C.R)
-
-    print(f"  mode      : {mode_color}{st['mode'].upper()}{C.R}")
-    print(f"  provider  : {st['provider'] or '—'}")
-    print(f"  label     : {st['label'] or '—'}")
-    print(f"  base_url  : {st['base_url'] or '—'}")
-    print(f"  model     : {st['model'] or '—'}")
-    print(f"  models    : {len(st['models'])} known")
-
-    b = st["budget"]
+    print("{}HUGINN :: brain status{}".format(C.CY + C.B, C.R))
+    print("{}{}{}".format(C.D, "─" * 60, C.R))
+    mode_color = {"full": C.GR, "local": C.CY, "off": C.RE}.get(st["mode"], C.R)
+    print("  mode      : {}{}{}".format(mode_color, st["mode"].upper(), C.R))
+    print("  provider  : {}".format(st["provider"] or "—"))
+    print("  label     : {}".format(st["label"] or "—"))
+    print("  base_url  : {}".format(st["base_url"] or "—"))
+    print("  model     : {}".format(st["model"] or "—"))
+    print("  models    : {} known".format(len(st["models"])))
+    bud = st["budget"]
     print()
-    print(f"  budget    : calls {b['calls']}/{b['max_calls']}  "
-          f"tokens {b['tokens_in'] + b['tokens_out']}/{b['max_tokens']}  "
-          f"cost ${b['cost_usd']:.4f}/${b['max_cost']}")
+    print("  budget    : calls {}/{}  tokens {}/{}  cost ${:.4f}/${}".format(
+        bud["calls"], bud["max_calls"],
+        bud["tokens_in"] + bud["tokens_out"], bud["max_tokens"],
+        bud["cost_usd"], bud["max_cost"]))
     print()
-
-    if st["mode"] == "off":
-        print(f"{C.YE}No provider available. Scanners will run without AI.{C.R}")
-        print(f"{C.D}  · Start Ollama, or set DEEPSEEK_API_KEY / GROQ_API_KEY / "
-              f"HUGGINGFACE_API_KEY{C.R}")
-        print(f"{C.D}  · Force off explicitly with BRAIN_MODE=off{C.R}")
-        print()
-
     return 0 if st["mode"] != "off" else 1
 
 
 def _cmd_test():
-    brain = get_brain()
-    if not brain.available():
-        log("brain is off — no provider available", "warn", "BRAIN")
+    b = get_brain()
+    if not b.available():
+        log("brain is off", "warn", "BRAIN")
         return 1
-    log(f"using {brain.cfg['label']} ({brain.model})", "info", "BRAIN")
-    reply = brain.chat(
-        [{"role": "user",
-          "content": "Reply with exactly: HUGINN-BRAIN-OK"}],
-        max_tokens=32, temperature=0.0,
-    )
+    log("using {} ({})".format(b.cfg["label"], b.model), "info", "BRAIN")
+    reply = b.chat(
+        [{"role": "user", "content": "Reply with exactly: HUGINN-BRAIN-OK"}],
+        max_tokens=32, temperature=0.0)
     if not reply:
         log("no reply", "err", "BRAIN")
         return 1
-    log(f"reply: {reply.strip()[:120]}", "ok", "BRAIN")
-    log(f"budget: {brain.budget.snapshot()}", "info", "BRAIN")
+    log("reply: {}".format(reply.strip()[:120]), "ok", "BRAIN")
     return 0
 
 
 def _cmd_models():
-    brain = get_brain()
-    if not brain.available():
+    b = get_brain()
+    if not b.available():
         log("brain is off", "warn", "BRAIN")
         return 1
-    section(f"Models on {brain.cfg['label']}")
-    for m in brain.models:
-        print(f"  · {m}")
+    section("Models on {}".format(b.cfg["label"]))
+    for m in b.models:
+        print("  · {}".format(m))
     return 0
 
 
-def _cmd_triage(path):
-    brain = get_brain()
-    if not brain.available():
+def _cmd_triage(path, kind=None):
+    b = get_brain()
+    if not b.available():
         log("brain is off", "warn", "BRAIN")
         return 1
     try:
         finding = load_json(path)
     except Exception as e:
-        log(f"cannot read {path}: {e}", "err")
+        log("cannot read {}: {}".format(path, e), "err")
         return 1
-    verdict = brain.triage(finding)
+    verdict = b.triage(finding, kind=kind)
     if not verdict:
         log("triage returned nothing", "warn", "BRAIN")
         return 1
     print()
-    print(f"{C.B}verdict   :{C.R} {verdict['verdict']}")
-    print(f"{C.B}confidence:{C.R} {verdict['confidence']:.2f}")
-    print(f"{C.B}reason    :{C.R} {verdict['reason']}")
-    print(f"{C.B}provider  :{C.R} {verdict['provider']} ({verdict['model']})")
+    print("{}verdict   :{} {}".format(C.B, C.R, verdict["verdict"]))
+    print("{}confidence:{} {:.2f}".format(C.B, C.R, verdict["confidence"]))
+    print("{}reason    :{} {}".format(C.B, C.R, verdict["reason"]))
+    print("{}profile   :{} {}".format(C.B, C.R, verdict["kind"]))
+    print("{}provider  :{} {} ({})".format(C.B, C.R,
+        verdict["provider"], verdict["model"]))
     print()
     return 0
 
 
 def _cli():
     import argparse
-    ap = argparse.ArgumentParser(prog="brain",
-                                 description="HUGINN brain CLI")
+    ap = argparse.ArgumentParser(prog="brain")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("status", help="show provider / budget status")
     sub.add_parser("test",   help="send a hello message")
     sub.add_parser("models", help="list models for the active provider")
+    sub.add_parser("providers", help="list all currently usable providers")
     p_t = sub.add_parser("triage", help="triage a finding JSON file")
     p_t.add_argument("file")
-    sub.add_parser("reset",  help="clear the singleton (for testing)")
+    p_t.add_argument("--kind", default=None,
+                     help="force scanner profile (sqli|xss|ssrf|...)")
+    sub.add_parser("reset",  help="clear singleton")
 
     args = ap.parse_args()
-    if args.cmd == "status":
-        return _cmd_status()
-    if args.cmd == "test":
-        return _cmd_test()
-    if args.cmd == "models":
-        return _cmd_models()
-    if args.cmd == "triage":
-        return _cmd_triage(args.file)
+    if args.cmd == "status":    return _cmd_status()
+    if args.cmd == "test":      return _cmd_test()
+    if args.cmd == "models":    return _cmd_models()
+    if args.cmd == "providers":
+        b = get_brain()
+        for s in b.available_providers():
+            print("  + {}".format(s))
+        return 0
+    if args.cmd == "triage":    return _cmd_triage(args.file, args.kind)
     if args.cmd == "reset":
         global _BRAIN
         with _BRAIN_LOCK:
