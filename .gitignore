@@ -3,12 +3,12 @@
 # =============================================================================
 
 # ---- Virtual environments ----------------------------------------------
-venv/
-.venv/
-env/
-ENV/
-virtualenv/
-virtualenvs/
+#venv/
+#.venv/
+#env/
+#ENV/
+#virtualenv/
+#virtualenvs/
 
 # ---- Python cache and bytecode -----------------------------------------
 __pycache__/
