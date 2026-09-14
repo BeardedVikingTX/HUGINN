@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-#  HUGINN :: sqli.py — v3.0
-#  SQL Injection Scanner — multi-strategy, confirmation-verified
+#  HUGINN :: sqli.py — v3.1
+#  SQL Injection Scanner — discovery + triage + confirmation-verified
 # -----------------------------------------------------------------------------
-#  Detection strategies (in order of confidence):
+#  Pipeline:
+#    DISCOVER  →  extract points (query/path/form/json/header/cookie/JS/GraphQL)
+#    TRIAGE    →  control + canary probes; drop unstable or dead points
+#    DEEP      →  full payload suite on promoted points only
+#    CONFIRM   →  every candidate must reproduce (with control where applicable)
+#    SAVE      →  confirmed findings only
 #
-#    1. error_signature    — DBMS error message matched in response
-#    2. boolean_blind      — TRUE/FALSE payload pair produces different responses
-#    3. timing_confirmed   — time-based delay reproduces across 3 attempts
-#    4. status_escalation  — 2xx/3xx -> 5xx with SQL-ish content
-#    5. baseline_diff      — response body substantially differs from baseline
+#  Detection strategies (in confidence order):
+#    1. error_signature    — DBMS error matched AND control payload clean
+#    2. timing_confirmed   — delay reproduces across 3 attempts
+#    3. boolean_blind      — TRUE/FALSE pair reproduces a differential
+#    4. status_escalation  — 2xx/3xx → 5xx with SQL-ish body, control clean
+#    5. body_diff          — ≥2 distinct payloads shift body same direction
 #
-#  What changed in v3.0:
-#    · Timing baseline is now 3-sample median + stddev, not single-shot
-#    · Timing hits require 3-successful reproductions before being reported
-#    · Boolean blind detection added (true/false differential)
-#    · Response fingerprinting (hash + length + status) for stable diffing
-#    · Path segment injection support
-#    · Static asset / CDN skip
-#    · WAF-aware per-host throttling
-#    · cURL command generation for every finding
-#    · Confirmation re-fire pass at the end
-#    · Session and cookie support via --cookie
+#  v3.1 changes vs v3.0:
+#    · JS/fetch/axios/$-ajax endpoint extraction
+#    · GraphQL endpoint detection + variables injection
+#    · Triage pass (control + canary) before deep-test — massive request saving
+#    · Error-based confirmation via benign control (kills generic 500 FPs)
+#    · Boolean-blind confirmation via second-pair reproduction
+#    · boolean_pair strategy wired in (dead code in v3.0)
+#    · Body-diff requires ≥2 distinct payloads to be saved
+#    · Only confirmed findings are persisted
 # =============================================================================
 
 import re
@@ -138,7 +142,7 @@ TIME_PAYLOADS = re.compile(
 
 
 # =============================================================================
-#  SKIP FILTERS — don't waste requests on static content
+#  SKIP FILTERS
 # =============================================================================
 SKIP_EXTENSIONS = {
     ".js", ".mjs", ".css", ".map",
@@ -149,12 +153,29 @@ SKIP_EXTENSIONS = {
     ".exe", ".dll", ".so", ".bin",
 }
 
-# Substrings in hostnames that indicate CDN/static infrastructure.
 CDN_HOST_MARKERS = (
     "cdn.", ".cdn.", "static.", "assets.", "img.", "images.",
     "fonts.", "rbxcdn", "akamai", "cloudfront", "cloudflare",
     "fastly", "jsdelivr", "gstatic", "googleapis",
 )
+
+
+# =============================================================================
+#  JS / GRAPHQL DISCOVERY PATTERNS
+# =============================================================================
+JS_CALL_PATTERNS = [
+    re.compile(r"""(?:fetch|axios(?:\.\w+)?|\$\.(?:ajax|get|post|put|delete|patch))\s*\(\s*["']([^"'\s]{2,300})["']"""),
+    re.compile(r"""(?:url|endpoint|path|api|action|href)\s*[:=]\s*["']([^"'\s]{2,300})["']""", re.I),
+]
+
+JS_API_SHAPE = re.compile(
+    r"""["']((?:https?://[^"'\s<>]+|/)[^"'\s<>]{0,200}?""" \
+    r"""(?:api|graphql|v\d+|rest|json|search|query|user|item|product|order|""" \
+    r"""filter|lookup|fetch|detail)[^"'\s<>]{0,200}?)["']""",
+    re.I,
+)
+
+GRAPHQL_PATH = re.compile(r"graphql", re.I)
 
 
 # =============================================================================
@@ -179,15 +200,9 @@ def _is_static_url(url):
 
 
 def _fingerprint_response(resp):
-    """
-    Stable fingerprint of a response for differential comparison.
-    Returns dict with hash, length, status.
-    """
     if resp is None:
         return {"hash": None, "length": 0, "status": None}
     body = resp.text or ""
-    # Hash the body without volatile content like CSRF tokens or nonces
-    # — replace long hex/base64 tokens with a placeholder first
     stable = re.sub(r"\b[a-f0-9]{24,}\b", "__HEX__", body)
     stable = re.sub(r"\b[A-Za-z0-9+/=]{40,}\b", "__B64__", stable)
     return {
@@ -198,17 +213,30 @@ def _fingerprint_response(resp):
 
 
 def _fingerprints_differ(a, b, min_len_delta=200):
-    """Two fingerprints differ meaningfully."""
     if a["hash"] is None or b["hash"] is None:
         return False
     if a["hash"] == b["hash"]:
         return False
     if abs(a["length"] - b["length"]) >= min_len_delta:
         return True
-    # Same-ish length but different content: still a diff
     if a["hash"] != b["hash"] and abs(a["length"] - b["length"]) > 20:
         return True
     return False
+
+
+def _make_false_variant(payload):
+    """Auto-derive the FALSE version of a TRUE-condition payload."""
+    patterns = [
+        (re.compile(r"'\s*1\s*'\s*=\s*'1", re.I), "'1'='2"),
+        (re.compile(r"'\s*1\s*'\s*=\s*1", re.I),  "'1'=2"),
+        (re.compile(r"\b1\s*=\s*1\b"),             "1=2"),
+        (re.compile(r"\btrue\b", re.I),            "false"),
+    ]
+    for pat, repl in patterns:
+        new = pat.sub(repl, payload, count=1)
+        if new != payload:
+            return new
+    return None
 
 
 # =============================================================================
@@ -258,17 +286,14 @@ def _extract_query_params(page):
 
 
 def _extract_path_segments(page):
-    """Path segment injection — e.g. /user/{id}/profile."""
     parsed = urlparse(page["url"])
     segs = [s for s in parsed.path.split("/") if s]
     if not segs:
         return []
     out = []
     for i, seg in enumerate(segs):
-        # Skip clearly-static segments
         if _is_static_url(f"http://x/{seg}"):
             continue
-        # Skip numeric-only path parts? No — those are prime injection targets.
         out.append(InjectionPoint(
             page["url"], "GET", "path", f"segment[{i}]", seg,
             extra_headers={"_segment_index": str(i)},
@@ -364,8 +389,114 @@ def _extract_json_body(page):
     return points
 
 
+# --------------------------------------------------------------------------- #
+#  JS / HTML endpoint discovery
+# --------------------------------------------------------------------------- #
+def _discover_js_endpoints(pages):
+    """
+    Parse crawled HTML/JS for API-shaped URLs and fetch()/axios/$-ajax calls.
+    Returns a list of deduped absolute URLs.
+    """
+    found = {}
+    for page in pages:
+        content = page.get("content") or ""
+        if not content or len(content) < 20:
+            continue
+        base = page.get("url") or ""
+        for pat in JS_CALL_PATTERNS + [JS_API_SHAPE]:
+            for m in pat.finditer(content):
+                raw = m.group(1)
+                if not raw or raw.startswith(("data:", "javascript:", "mailto:")):
+                    continue
+                try:
+                    full = urljoin(base, raw)
+                except Exception:
+                    continue
+                if _is_static_url(full):
+                    continue
+                p = urlparse(full)
+                if not p.netloc or not p.path:
+                    continue
+                key = urlunparse(p._replace(fragment=""))
+                found[key] = True
+    return list(found.keys())
+
+
+def _points_from_discovered_urls(urls):
+    points = []
+    for u in urls:
+        parsed = urlparse(u)
+        if parsed.query:
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            for k, v in qs.items():
+                points.append(InjectionPoint(u, "GET", "query", k, v[0]))
+    return points
+
+
+# --------------------------------------------------------------------------- #
+#  GraphQL detection
+# --------------------------------------------------------------------------- #
+def _graphql_probe_urls(pages, discovered_urls):
+    cands = set()
+    for u in discovered_urls:
+        if GRAPHQL_PATH.search(u):
+            cands.add(u)
+    for page in pages:
+        u = page.get("url") or ""
+        if GRAPHQL_PATH.search(u):
+            cands.add(u)
+        p = urlparse(u)
+        if p.scheme and p.netloc:
+            for path in ("/graphql", "/api/graphql", "/v1/graphql",
+                         "/query", "/api/query"):
+                cands.add(f"{p.scheme}://{p.netloc}{path}")
+    return list(cands)
+
+
+def _is_graphql_endpoint(url, static_headers, timeout):
+    body = json.dumps({"query": "{__typename}"})
+    headers = dict(static_headers)
+    headers["Content-Type"] = "application/json"
+    headers["Accept"] = "application/json"
+    try:
+        r = send_request(url, method="POST", headers=headers,
+                         data=body, timeout=timeout, allow_redirects=False)
+    except Exception:
+        return False
+    if r is None:
+        return False
+    txt = (r.text or "").strip()
+    if not txt:
+        return False
+    try:
+        j = json.loads(txt)
+    except Exception:
+        return False
+    return isinstance(j, dict) and ("data" in j or "errors" in j)
+
+
+def _graphql_injection_points(url, static_headers, timeout):
+    var_names = ("id", "q", "query", "search", "filter", "value", "input")
+    points = []
+    for vn in var_names:
+        body = {
+            "query": "query Q($%s: String) { __typename }" % vn,
+            "variables": {vn: "1"},
+        }
+        points.append(InjectionPoint(
+            url, "POST", "body_json", f"$.variables.{vn}", "1",
+            json_path=f"$.variables.{vn}", json_body=body,
+            content_type="application/json",
+        ))
+    return points
+
+
+# --------------------------------------------------------------------------- #
+#  Top-level extraction
+# --------------------------------------------------------------------------- #
 def extract_injection_points(pages):
     points, seen = [], set()
+
     for page in pages:
         url = page.get("url", "")
         if _is_static_url(url):
@@ -385,7 +516,16 @@ def extract_injection_points(pages):
                 continue
             seen.add(k)
             points.append(ip)
-    return points
+
+    discovered = _discover_js_endpoints(pages)
+    for ip in _points_from_discovered_urls(discovered):
+        k = ip.key()
+        if k in seen:
+            continue
+        seen.add(k)
+        points.append(ip)
+
+    return points, discovered
 
 
 # =============================================================================
@@ -509,10 +649,6 @@ def build_curl(ip, payload, timeout=15):
 #  DETECTION PRIMITIVES
 # =============================================================================
 def _match_error_signature(body, baseline_body=""):
-    """
-    Match a DBMS error signature in `body` that is NOT already present
-    in the baseline.
-    """
     if not body:
         return None, None
     baseline_low = baseline_body.lower() if baseline_body else ""
@@ -529,11 +665,7 @@ def _match_error_signature(body, baseline_body=""):
 
 
 def _severity_for(confidence):
-    return {
-        "high": "high",
-        "medium": "medium",
-        "low": "low",
-    }.get(confidence, "low")
+    return {"high": "high", "medium": "medium", "low": "low"}.get(confidence, "low")
 
 
 # =============================================================================
@@ -566,7 +698,6 @@ class SQLiScanner:
         self.time_threshold = time_threshold
         self.confirm_timing = confirm_timing
 
-        # Static headers applied to every request
         self.static_headers = {}
         if cookie:
             self.static_headers["Cookie"] = cookie
@@ -575,13 +706,10 @@ class SQLiScanner:
 
         self.seen_signatures = set()
         self._payload_cache = None
-
-        # Per-host throttle
         self._throttle_last = {}
         self._throttle_lock = threading.Lock()
+        self._save_lock = threading.Lock()
 
-    # ------------------------------------------------------------------ #
-    #  Per-host throttle
     # ------------------------------------------------------------------ #
     def _throttle(self, url):
         host = urlparse(url).netloc.lower()
@@ -595,13 +723,10 @@ class SQLiScanner:
             self._throttle_last[host] = now
 
     # ------------------------------------------------------------------ #
-    #  Payload loading & filtering
-    # ------------------------------------------------------------------ #
     def load_and_filter_payloads(self):
         data = load_payloads("sqli")
         raw = data.get("payloads", [])
         filtered = []
-
         for entry in raw:
             if isinstance(entry, str):
                 filtered.append({
@@ -610,27 +735,22 @@ class SQLiScanner:
                     "payload": entry, "tags": [], "description": "",
                 })
                 continue
-
             entry_waf = entry.get("waf")
             if self.waf_hint and entry_waf:
                 if self.waf_hint.lower() not in entry_waf.lower():
                     continue
-
             entry_dbms = (entry.get("dbms") or "all").lower()
             if self.dbms_hint and entry_dbms not in ("all", "generic"):
                 if self.dbms_hint.lower() not in entry_dbms:
                     continue
-
             filtered.append(entry)
-
         self._payload_cache = filtered
         return filtered
 
     # ------------------------------------------------------------------ #
-    #  Baseline capture — response AND timing
+    #  Baseline
     # ------------------------------------------------------------------ #
     def capture_baseline(self, ip):
-        # Response baseline
         try:
             ip.baseline_resp = build_request(ip, ip.value, timeout=self.timeout,
                                              extra_headers=self.static_headers)
@@ -638,7 +758,6 @@ class SQLiScanner:
             ip.baseline_resp = None
         ip.baseline_fp = _fingerprint_response(ip.baseline_resp)
 
-        # Timing baseline — 3 samples, take median + stddev
         samples = []
         for _ in range(3):
             self._throttle(ip.url)
@@ -659,57 +778,215 @@ class SQLiScanner:
 
         return ip.baseline_resp
 
-    # ------------------------------------------------------------------ #
-    #  Strategy 1: Error signature (with baseline diff)
-    # ------------------------------------------------------------------ #
-    def _test_error_based(self, ip, payload_obj, resp, baseline_body):
-        body = resp.text or ""
-        dbms, evidence = _match_error_signature(body, baseline_body)
-        if not dbms:
+    # ================================================================== #
+    #  TRIAGE
+    # ================================================================== #
+    def _triage_point(self, ip):
+        if ip.baseline_resp is None:
+            return False, {}
+
+        # --- stability check with a benign control --------------------
+        control = "hgnnctrl" + ("z" * 6)
+        try:
+            ctrl = build_request(ip, control, timeout=self.timeout,
+                                 extra_headers=self.static_headers)
+        except Exception:
+            ctrl = None
+
+        if ctrl is not None and ip.baseline_fp:
+            ctrl_fp = _fingerprint_response(ctrl)
+            if _fingerprints_differ(ctrl_fp, ip.baseline_fp, min_len_delta=200):
+                self._throttle(ip.url)
+                try:
+                    ctrl2 = build_request(ip, control, timeout=self.timeout,
+                                          extra_headers=self.static_headers)
+                except Exception:
+                    ctrl2 = None
+                if ctrl2 is not None:
+                    ctrl2_fp = _fingerprint_response(ctrl2)
+                    if _fingerprints_differ(ctrl_fp, ctrl2_fp, min_len_delta=200):
+                        log(f"  skip (unstable baseline): {ip.url} [{ip.name}]",
+                            "info", "SQLI")
+                        return False, {"unstable": True}
+
+        hints = {}
+        baseline_body = ip.baseline_resp.text or ""
+
+        # --- quote canaries -------------------------------------------
+        for canary in ("'", '"'):
+            self._throttle(ip.url)
+            try:
+                r = build_request(ip, canary, timeout=self.timeout,
+                                  extra_headers=self.static_headers)
+            except Exception:
+                continue
+            if r is None:
+                continue
+            body = r.text or ""
+
+            dbms, evidence = _match_error_signature(body, baseline_body)
+            if dbms:
+                hints["error"] = True
+                hints["dbms"] = dbms
+                hints["evidence"] = evidence
+                return True, hints
+
+            if ip.baseline_resp.status_code < 500 and r.status_code >= 500 \
+                    and GENERIC_500_HINTS.search(body):
+                hints["status"] = True
+                return True, hints
+
+            fp = _fingerprint_response(r)
+            if _fingerprints_differ(fp, ip.baseline_fp, min_len_delta=200):
+                hints["body"] = True
+                return True, hints
+
+        # --- boolean pair canary --------------------------------------
+        tp = "' AND '1'='1"
+        fp_ = "' AND '1'='2"
+        try:
+            self._throttle(ip.url)
+            tr = build_request(ip, tp, timeout=self.timeout,
+                               extra_headers=self.static_headers)
+            time.sleep(0.15)
+            self._throttle(ip.url)
+            fr = build_request(ip, fp_, timeout=self.timeout,
+                               extra_headers=self.static_headers)
+            if tr is not None and fr is not None:
+                tfp = _fingerprint_response(tr)
+                ffp = _fingerprint_response(fr)
+                if _fingerprints_differ(tfp, ffp, min_len_delta=80):
+                    hints["boolean"] = True
+                    return True, hints
+        except Exception:
+            pass
+
+        return False, hints
+
+    # ================================================================== #
+    #  CONFIRMATION HELPERS
+    # ================================================================== #
+    def _confirm_error_based(self, ip, payload, first_dbms):
+        baseline_body = (ip.baseline_resp.text or "") if ip.baseline_resp else ""
+
+        # 1. Reproduce
+        self._throttle(ip.url)
+        try:
+            r = build_request(ip, payload, timeout=self.timeout,
+                              extra_headers=self.static_headers)
+        except Exception:
+            return False
+        if r is None:
+            return False
+        dbms2, _ = _match_error_signature(r.text or "", baseline_body)
+        if dbms2 != first_dbms:
+            return False
+
+        # 2. Control check
+        control = re.sub(r"[^A-Za-z0-9]", "z", payload)
+        if control == payload or not control:
+            return True
+
+        self._throttle(ip.url)
+        try:
+            cr = build_request(ip, control, timeout=self.timeout,
+                               extra_headers=self.static_headers)
+        except Exception:
+            return True
+        if cr is None:
+            return True
+        cdbms, _ = _match_error_signature(cr.text or "", baseline_body)
+        if cdbms:
+            log(f"  reject (control also errors): {ip.url} [{ip.name}]",
+                "info", "SQLI")
+            return False
+        return True
+
+    def _confirm_status_escalation(self, ip, payload):
+        if ip.baseline_resp is None:
+            return False
+
+        self._throttle(ip.url)
+        try:
+            r = build_request(ip, payload, timeout=self.timeout,
+                              extra_headers=self.static_headers)
+        except Exception:
+            return False
+        if r is None or r.status_code < 500:
+            return False
+
+        control = re.sub(r"[^A-Za-z0-9]", "z", payload)
+        if control == payload or not control:
+            return True
+
+        self._throttle(ip.url)
+        try:
+            cr = build_request(ip, control, timeout=self.timeout,
+                               extra_headers=self.static_headers)
+        except Exception:
+            return True
+        if cr is None:
+            return True
+        if cr.status_code >= 500:
+            return False
+        return True
+
+    def _test_boolean_pair_confirmed(self, ip, true_p, false_p):
+        try:
+            self._throttle(ip.url)
+            tr = build_request(ip, true_p, timeout=self.timeout,
+                               extra_headers=self.static_headers)
+            time.sleep(0.15)
+            self._throttle(ip.url)
+            fr = build_request(ip, false_p, timeout=self.timeout,
+                               extra_headers=self.static_headers)
+        except Exception:
+            return None
+        if tr is None or fr is None:
+            return None
+
+        tfp = _fingerprint_response(tr)
+        ffp = _fingerprint_response(fr)
+        if not _fingerprints_differ(tfp, ffp, min_len_delta=80):
+            return None
+
+        base_fp = ip.baseline_fp or {"hash": None, "length": 0, "status": None}
+        if not (_fingerprints_differ(tfp, base_fp, min_len_delta=80)
+                or _fingerprints_differ(ffp, base_fp, min_len_delta=80)):
+            return None
+
+        # --- reproduction pass ----------------------------------------
+        self._throttle(ip.url)
+        time.sleep(0.3)
+        try:
+            self._throttle(ip.url)
+            tr2 = build_request(ip, true_p, timeout=self.timeout,
+                                extra_headers=self.static_headers)
+            time.sleep(0.15)
+            self._throttle(ip.url)
+            fr2 = build_request(ip, false_p, timeout=self.timeout,
+                                extra_headers=self.static_headers)
+        except Exception:
+            return None
+        if tr2 is None or fr2 is None:
+            return None
+
+        tfp2 = _fingerprint_response(tr2)
+        ffp2 = _fingerprint_response(fr2)
+        if not _fingerprints_differ(tfp2, ffp2, min_len_delta=80):
             return None
 
         return {
+            "subtype": "boolean_blind",
             "confidence": "high",
-            "subtype": "error_based",
-            "reason": f"DBMS error signature matched ({dbms})",
-            "dbms": dbms,
-            "evidence": evidence,
-            "verification_method": "error_signature",
+            "reason": "Boolean-based blind — TRUE/FALSE differential reproduced twice",
+            "dbms": self.dbms_hint,
+            "evidence": (f"true_len={tfp['length']} false_len={ffp['length']} "
+                         f"base_len={base_fp.get('length', 0)}"),
+            "verification_method": "boolean_pair",
         }
 
-    # ------------------------------------------------------------------ #
-    #  Strategy 2: Status escalation with SQL-ish body
-    # ------------------------------------------------------------------ #
-    def _test_status_escalation(self, ip, resp):
-        if ip.baseline_resp is None:
-            return None
-        base_status = ip.baseline_resp.status_code
-        if base_status < 500 and resp.status_code >= 500:
-            body = resp.text or ""
-            if GENERIC_500_HINTS.search(body):
-                return {
-                    "confidence": "medium",
-                    "subtype": "status_escalation",
-                    "reason": (f"Status escalated {base_status} -> "
-                               f"{resp.status_code} with SQL-ish body"),
-                    "dbms": None,
-                    "evidence": body[:400],
-                    "verification_method": "status_escalation",
-                }
-        return None
-
-    # ------------------------------------------------------------------ #
-    #  Strategy 3: Time-based with confirmation
-    # ------------------------------------------------------------------ #
     def _test_timing_confirmed(self, ip, payload, first_elapsed):
-        """
-        Time-based detection with 3-attempt reproduction.
-
-        Requires:
-          · baseline timing calibrated (done in capture_baseline)
-          · first attempt shows delay > threshold + baseline
-          · two more attempts reproduce the delay within ±25%
-        """
         if ip.timing_baseline is None:
             return None
 
@@ -721,8 +998,6 @@ class SQLiScanner:
         if first_delta < threshold - 2.0:
             return None
 
-        # If confirmation is disabled, we still require the FIRST attempt
-        # to exceed the threshold.
         if not self.confirm_timing:
             if first_delta >= threshold:
                 return {
@@ -736,7 +1011,6 @@ class SQLiScanner:
                 }
             return None
 
-        # Confirmation pass — 2 more attempts
         reproductions = 0
         for _ in range(2):
             self._throttle(ip.url)
@@ -767,91 +1041,14 @@ class SQLiScanner:
             "verification_method": "timing_confirmed",
         }
 
-    # ------------------------------------------------------------------ #
-    #  Strategy 4: Boolean-based blind (paired payloads)
-    # ------------------------------------------------------------------ #
-    def _test_boolean_pair(self, ip, true_payload, false_payload):
-        """
-        Fire TRUE and FALSE versions of the same payload. If the responses
-        differ (and both differ from baseline), we have boolean-based blind.
-        """
-        try:
-            true_resp = build_request(ip, true_payload, timeout=self.timeout,
-                                      extra_headers=self.static_headers)
-            self._throttle(ip.url)
-            time.sleep(0.1)
-            false_resp = build_request(ip, false_payload, timeout=self.timeout,
-                                       extra_headers=self.static_headers)
-        except Exception:
-            return None
-
-        if true_resp is None or false_resp is None:
-            return None
-
-        true_fp  = _fingerprint_response(true_resp)
-        false_fp = _fingerprint_response(false_resp)
-        base_fp  = ip.baseline_fp or {"hash": None}
-
-        # True and False must differ from EACH OTHER
-        if not _fingerprints_differ(true_fp, false_fp, min_len_delta=100):
-            return None
-
-        # And at least one of them must differ from baseline
-        # (otherwise both are the "default" response)
-        t_base_diff = _fingerprints_differ(true_fp, base_fp, min_len_delta=100)
-        f_base_diff = _fingerprints_differ(false_fp, base_fp, min_len_delta=100)
-        if not (t_base_diff or f_base_diff):
-            return None
-
-        return {
-            "confidence": "high",
-            "subtype": "boolean_blind",
-            "reason": ("Boolean-based blind — TRUE and FALSE payloads "
-                       "produce different responses"),
-            "dbms": self.dbms_hint,
-            "evidence": (f"true_len={true_fp['length']} "
-                         f"false_len={false_fp['length']} "
-                         f"base_len={base_fp.get('length', 0)}"),
-            "verification_method": "boolean_pair",
-        }
-
-    # ------------------------------------------------------------------ #
-    #  Strategy 5: Body diff vs baseline (weakest signal)
-    # ------------------------------------------------------------------ #
-    def _test_body_diff(self, ip, resp):
-        if not ip.baseline_fp or not ip.baseline_fp.get("hash"):
-            return None
-        if ip.baseline_resp is None:
-            return None
-
-        current = _fingerprint_response(resp)
-        if not _fingerprints_differ(current, ip.baseline_fp, min_len_delta=500):
-            return None
-
-        # Only flag if the delta direction suggests injection
-        # (response grew significantly)
-        delta = current["length"] - ip.baseline_fp["length"]
-        if delta < 500:
-            return None
-
-        return {
-            "confidence": "low",
-            "subtype": "body_diff",
-            "reason": f"Response body grew by {delta} bytes",
-            "dbms": None,
-            "evidence": f"baseline={ip.baseline_fp['length']} current={current['length']}",
-            "verification_method": "body_diff",
-        }
-
-    # ------------------------------------------------------------------ #
-    #  Test one payload against one injection point
-    # ------------------------------------------------------------------ #
-    def test_payload(self, ip, payload_obj, baseline_body=""):
+    # ================================================================== #
+    #  PAYLOAD ATTEMPT
+    # ================================================================== #
+    def _attempt_payload(self, ip, payload_obj, baseline_body):
         payload = payload_obj["payload"]
         is_time = bool(TIME_PAYLOADS.search(payload))
 
         self._throttle(ip.url)
-
         start = time.time()
         try:
             resp = build_request(ip, payload, timeout=self.timeout + 4,
@@ -862,39 +1059,82 @@ class SQLiScanner:
         if resp is None:
             return None
 
-        # ---- Strategy 1: Error signature ----------------------------
-        hit = self._test_error_based(ip, payload_obj, resp, baseline_body)
-        if hit:
-            return self._build_finding(ip, payload_obj, hit, resp,
-                                       elapsed, payload)
+        # --- Strategy 1: error-based --------------------------------
+        dbms, evidence = _match_error_signature(resp.text or "", baseline_body)
+        if dbms:
+            if self._confirm_error_based(ip, payload, dbms):
+                return {
+                    "subtype": "error_based",
+                    "confidence": "high",
+                    "reason": f"DBMS error signature matched ({dbms})",
+                    "dbms": dbms,
+                    "evidence": evidence,
+                    "verification_method": "error_signature",
+                    "_resp": resp, "_elapsed": elapsed,
+                }
 
-        # ---- Strategy 2: Status escalation --------------------------
-        hit = self._test_status_escalation(ip, resp)
-        if hit:
-            return self._build_finding(ip, payload_obj, hit, resp,
-                                       elapsed, payload)
+        # --- Strategy 2: status escalation ---------------------------
+        if ip.baseline_resp and ip.baseline_resp.status_code < 500 \
+                and resp.status_code >= 500:
+            if GENERIC_500_HINTS.search(resp.text or ""):
+                if self._confirm_status_escalation(ip, payload):
+                    return {
+                        "subtype": "status_escalation",
+                        "confidence": "medium",
+                        "reason": (f"Status escalated "
+                                   f"{ip.baseline_resp.status_code} → "
+                                   f"{resp.status_code} with SQL-ish body"),
+                        "dbms": None,
+                        "evidence": (resp.text or "")[:400],
+                        "verification_method": "status_escalation",
+                        "_resp": resp, "_elapsed": elapsed,
+                    }
 
-        # ---- Strategy 3: Time-based confirmed -----------------------
+        # --- Strategy 3: boolean pair --------------------------------
+        if ("'1'='1" in payload) or re.search(r"\b1\s*=\s*1\b", payload):
+            false_variant = _make_false_variant(payload)
+            if false_variant and false_variant != payload:
+                hit = self._test_boolean_pair_confirmed(ip, payload, false_variant)
+                if hit:
+                    hit["_resp"] = resp
+                    hit["_elapsed"] = elapsed
+                    return hit
+
+        # --- Strategy 4: time-based ----------------------------------
         if is_time:
             hit = self._test_timing_confirmed(ip, payload, elapsed)
             if hit:
-                return self._build_finding(ip, payload_obj, hit, resp,
-                                           elapsed, payload)
+                hit["_resp"] = resp
+                hit["_elapsed"] = elapsed
+                return hit
 
-        # ---- Strategy 5: Body diff (weak) ---------------------------
-        # Only for non-time payloads on non-error responses
-        if not is_time and resp.status_code < 500:
-            hit = self._test_body_diff(ip, resp)
-            if hit:
-                return self._build_finding(ip, payload_obj, hit, resp,
-                                           elapsed, payload)
+        # --- Strategy 5: body diff (weak) ----------------------------
+        if not is_time and resp.status_code < 500 and ip.baseline_fp:
+            current = _fingerprint_response(resp)
+            if _fingerprints_differ(current, ip.baseline_fp, min_len_delta=500):
+                delta = current["length"] - ip.baseline_fp["length"]
+                if abs(delta) >= 500:
+                    return {
+                        "subtype": "body_diff",
+                        "confidence": "low",
+                        "reason": f"Response body shifted by {delta} bytes",
+                        "dbms": None,
+                        "evidence": (f"baseline={ip.baseline_fp['length']} "
+                                     f"current={current['length']}"),
+                        "verification_method": "body_diff",
+                        "_resp": resp, "_elapsed": elapsed,
+                    }
 
         return None
 
-    # ------------------------------------------------------------------ #
-    #  Build finding
-    # ------------------------------------------------------------------ #
-    def _build_finding(self, ip, payload_obj, hit, resp, elapsed, payload):
+    # ================================================================== #
+    #  FINDING PERSISTENCE
+    # ================================================================== #
+    def _save_finding(self, ip, payload_obj, hit):
+        resp = hit.get("_resp")
+        elapsed = hit.get("_elapsed", 0.0)
+        payload = payload_obj["payload"]
+
         confidence = hit["confidence"]
         severity = _severity_for(confidence)
 
@@ -951,19 +1191,19 @@ class SQLiScanner:
             ),
         }
 
-        sig = hashlib.md5(
-            f"{ip.url}|{ip.name}|{payload_obj.get('id')}|{confidence}".encode()
-        ).hexdigest()
-        if sig in self.seen_signatures:
-            return None
-        self.seen_signatures.add(sig)
+        with self._save_lock:
+            sig = hashlib.md5(
+                f"{ip.url}|{ip.name}|{payload_obj.get('id')}|{confidence}".encode()
+            ).hexdigest()
+            if sig in self.seen_signatures:
+                return None
+            self.seen_signatures.add(sig)
 
         host = urlparse(ip.url).netloc
         slug = safe_filename(
-            (urlparse(ip.url).path or "/").replace("/", "_")
-            + "__" + ip.name
+            (urlparse(ip.url).path or "/").replace("/", "_") + "__" + ip.name
         )
-        fname = (f"{slug}__{payload_obj.get('id','x')}_sqli_vulnerable.json")
+        fname = f"{slug}__{payload_obj.get('id','x')}_sqli_vulnerable.json"
         out_path = self.findings_root / safe_filename(host) / fname
         save_json(out_path, finding)
 
@@ -981,25 +1221,54 @@ class SQLiScanner:
         )
         return finding
 
-    # ------------------------------------------------------------------ #
-    #  Test one injection point
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    #  TEST ONE POINT
+    # ================================================================== #
     def test_point(self, ip, payloads):
         self.capture_baseline(ip)
+
+        interesting, hints = self._triage_point(ip)
+        if not interesting:
+            return []
+
         baseline_body = (ip.baseline_resp.text or "") if ip.baseline_resp else ""
 
-        findings = []
-        for p in payloads:
-            f = self.test_payload(ip, p, baseline_body)
-            if f:
-                findings.append(f)
-                # Don't stop — different payloads may find different issues
-            time.sleep(self.delay)
-        return findings
+        strong_hits = []
+        bodydiff_hits = []
 
-    # ------------------------------------------------------------------ #
-    #  Main entry
-    # ------------------------------------------------------------------ #
+        for p in payloads:
+            try:
+                hit = self._attempt_payload(ip, p, baseline_body)
+            except Exception as e:
+                log(f"  payload error on {ip}: {e}", "warn", "SQLI")
+                hit = None
+            if hit:
+                if hit["subtype"] == "body_diff":
+                    bodydiff_hits.append((hit, p))
+                else:
+                    strong_hits.append((hit, p))
+            time.sleep(self.delay)
+
+        saved = []
+        for hit, p in strong_hits:
+            f = self._save_finding(ip, p, hit)
+            if f:
+                saved.append(f)
+
+        # Body-diff requires ≥2 DISTINCT payload IDs showing the shift
+        if bodydiff_hits:
+            distinct_ids = {p.get("id") for _, p in bodydiff_hits}
+            if len(distinct_ids) >= 2:
+                for hit, p in bodydiff_hits[:3]:
+                    f = self._save_finding(ip, p, hit)
+                    if f:
+                        saved.append(f)
+
+        return saved
+
+    # ================================================================== #
+    #  MAIN
+    # ================================================================== #
     def run(self):
         section("SQLi SCANNER :: INITIALISING")
 
@@ -1021,14 +1290,36 @@ class SQLiScanner:
 
         log(f"loaded {len(pages)} testable pages", "info")
 
-        points = extract_injection_points(pages)
-        log(f"extracted {len(points)} injection points", "ok")
+        points, discovered_urls = extract_injection_points(pages)
+        log(f"extracted {len(points)} injection points "
+            f"({len(discovered_urls)} JS-discovered URLs)", "ok")
+
+        # ---- GraphQL detection ----------------------------------------
+        gql_candidates = _graphql_probe_urls(pages, discovered_urls)
+        gql_points = []
+        for gu in gql_candidates[:25]:
+            if _is_static_url(gu):
+                continue
+            if _is_graphql_endpoint(gu, self.static_headers, self.timeout):
+                log(f"graphql endpoint detected: {gu}", "ok", "SQLI")
+                gql_points.extend(
+                    _graphql_injection_points(gu, self.static_headers, self.timeout)
+                )
+                break
+
+        if gql_points:
+            log(f"added {len(gql_points)} GraphQL injection points", "ok")
+            existing = {ip.key() for ip in points}
+            for ip in gql_points:
+                if ip.key() not in existing:
+                    points.append(ip)
+                    existing.add(ip.key())
 
         if not points:
             log("nothing to test", "warn")
             return []
 
-        section("SQLi SCANNER :: STRIKE PHASE")
+        section("SQLi SCANNER :: TRIAGE + STRIKE PHASE")
         all_findings = []
         done = 0
         total = len(points)
@@ -1047,11 +1338,10 @@ class SQLiScanner:
                     log(f"progress {done}/{total}  hits={len(all_findings)}",
                         "info")
 
-        # -------- Summary ------------------------------------------------
+        # ---- Summary --------------------------------------------------
         section("SQLi SCANNER :: COMPLETE")
         if all_findings:
-            by_conf = {}
-            by_method = {}
+            by_conf, by_method = {}, {}
             for f in all_findings:
                 by_conf[f["confidence"]] = by_conf.get(f["confidence"], 0) + 1
                 m = f.get("verification_method", "unknown")
@@ -1060,9 +1350,9 @@ class SQLiScanner:
                 if c in by_conf:
                     log(f"{c:8} : {by_conf[c]}", "ok")
             log(f"methods  : {by_method}", "info")
-            log(f"total findings: {len(all_findings)}", "ok", "DONE")
+            log(f"total CONFIRMED findings: {len(all_findings)}", "ok", "DONE")
         else:
-            log("no SQLi findings", "info", "DONE")
+            log("no confirmed SQLi findings", "info", "DONE")
 
         save_json(self.findings_root / "_summary.json", {
             "total": len(all_findings),
@@ -1109,7 +1399,7 @@ def run(program_dir, sites_root=None, waf_hint=None, dbms_hint=None,
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="HUGINN SQLi scanner")
+    ap = argparse.ArgumentParser(description="HUGINN SQLi scanner v3.1")
     ap.add_argument("program_dir")
     ap.add_argument("--waf", default=None, help="WAF hint (cloudflare, akamai, ...)")
     ap.add_argument("--dbms", default=None,
