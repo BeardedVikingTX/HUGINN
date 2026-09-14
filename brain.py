@@ -35,7 +35,7 @@
 #    python3 brain.py models           # list models for the active provider
 # =============================================================================
 
-# from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
